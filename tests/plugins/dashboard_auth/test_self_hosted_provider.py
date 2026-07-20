@@ -132,6 +132,7 @@ def _make_provider(
     *,
     scopes: str | None = None,
     client_secret: str | None = None,
+    allowed_emails: list[str] | None = None,
     auth_methods: Any = "__unset__",
 ):
     """Construct a provider with discovery + JWKS stubbed (no network).
@@ -146,6 +147,8 @@ def _make_provider(
         kwargs["scopes"] = scopes
     if client_secret is not None:
         kwargs["client_secret"] = client_secret
+    if allowed_emails is not None:
+        kwargs["allowed_emails"] = allowed_emails
     p = oidc_plugin.SelfHostedOIDCProvider(**kwargs)
     # Pre-seed discovery so nothing hits the network.
     disco = dict(_DISCOVERY_DOC)
@@ -230,6 +233,27 @@ class TestConstruction:
             issuer=_ISSUER, client_id=_CLIENT_ID, scopes="   "
         )
         assert p._scopes == "openid profile email"
+
+    @pytest.mark.parametrize(
+        "allowed_emails",
+        [
+            None,
+            "joey@samudioagency.com",
+            [],
+            [""],
+            ["   "],
+            [123],
+            [None],
+            ["joey@samudioagency.com", 123],
+        ],
+    )
+    def test_rejects_empty_or_invalid_email_allowlist(self, allowed_emails):
+        with pytest.raises(ValueError, match="allowed_emails"):
+            oidc_plugin.SelfHostedOIDCProvider(
+                issuer=_ISSUER,
+                client_id=_CLIENT_ID,
+                allowed_emails=allowed_emails,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +896,54 @@ class TestVerifySession:
         assert session.email == "alice@example.com"
         assert session.display_name == "Alice Example"
 
+    def test_email_allowlist_accepts_verified_matching_account(self, rsa_keypair):
+        provider = _make_provider(
+            rsa_keypair, allowed_emails=["joey@samudioagency.com"]
+        )
+        token = _mint_id_token(
+            rsa_keypair,
+            email="joey@samudioagency.com",
+            extra_claims={"email_verified": True},
+        )
+        session = provider.verify_session(access_token=token)
+        assert session is not None
+        assert session.email == "joey@samudioagency.com"
+
+    @pytest.mark.parametrize(
+        ("email", "email_verified"),
+        [
+            ("intruder@example.com", True),
+            ("joey@samudioagency.com", False),
+            ("joey@samudioagency.com", None),
+        ],
+    )
+    def test_email_allowlist_rejects_denied_or_unverified_accounts(
+        self, rsa_keypair, email, email_verified
+    ):
+        provider = _make_provider(
+            rsa_keypair, allowed_emails=["joey@samudioagency.com"]
+        )
+        extra_claims = (
+            {"email_verified": email_verified}
+            if email_verified is not None
+            else None
+        )
+        token = _mint_id_token(
+            rsa_keypair, email=email, extra_claims=extra_claims
+        )
+        assert provider.verify_session(access_token=token) is None
+
+    def test_email_allowlist_comparison_is_case_insensitive(self, rsa_keypair):
+        provider = _make_provider(
+            rsa_keypair, allowed_emails=["Joey@SamudioAgency.com"]
+        )
+        token = _mint_id_token(
+            rsa_keypair,
+            email="JOEY@SAMUDIOAGENCY.COM",
+            extra_claims={"email_verified": True},
+        )
+        assert provider.verify_session(access_token=token) is not None
+
     def test_expired_returns_none(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair, ttl_seconds=-1)
         assert provider.verify_session(access_token=token) is None
@@ -973,6 +1045,29 @@ class TestRefreshAndRevoke:
         assert kwargs["data"]["grant_type"] == "refresh_token"
         assert kwargs["data"]["refresh_token"] == "rt_old"
         assert kwargs["data"]["client_id"] == _CLIENT_ID
+
+    def test_refresh_denied_email_forces_reauthentication(self, rsa_keypair):
+        provider = _make_provider(
+            rsa_keypair, allowed_emails=["joey@samudioagency.com"]
+        )
+        denied_token = _mint_id_token(
+            rsa_keypair,
+            email="intruder@example.com",
+            extra_claims={"email_verified": True},
+        )
+        mock_resp = _mock_post(
+            200,
+            {
+                "id_token": denied_token,
+                "token_type": "Bearer",
+                "refresh_token": "rt_rotated",
+            },
+        )
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            with pytest.raises(RefreshExpiredError, match="not authorized"):
+                provider.refresh_session(refresh_token="rt_old")
 
     def test_refresh_keeps_previous_rt_when_idp_omits(self, provider, rsa_keypair):
         # Some IDPs don't rotate; keep the caller's existing RT alive.
@@ -1149,6 +1244,36 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._scopes == "openid email"
+
+    def test_allowed_emails_from_config(self, patch_config):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "allowed_emails": ["Joey@SamudioAgency.com"],
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._allowed_emails == {"joey@samudioagency.com"}
+
+    def test_explicit_null_allowed_emails_fails_closed(self, patch_config):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "allowed_emails": None,
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "allowed_emails" in oidc_plugin.LAST_SKIP_REASON
 
     def test_config_load_failure_falls_through(self, monkeypatch):
         def _broken():

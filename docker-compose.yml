@@ -26,18 +26,31 @@
 #     and API_SERVER_HOST. See docs/user-guide/api-server.md before doing
 #     this on an internet-facing host.
 #
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   gateway:
     build: .
-    image: hermes-agent
+    image: hermes-agent:js-dashboard-hardened
     container_name: hermes
     restart: unless-stopped
+    # Keep a runaway browser, build, or subagent from exhausting this
+    # 4-vCPU / 8-GiB host. CPU is throttled only when the container is busy.
+    cpus: 3.0
+    mem_limit: 6g
+    mem_reservation: 2g
+    pids_limit: 2048
     network_mode: host
     volumes:
       - ~/.hermes:/opt/data
+    logging: *default-logging
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_UID=${HERMES_UID:?HERMES_UID is required; use start-dashboard.sh}
+      - HERMES_GID=${HERMES_GID:?HERMES_GID is required; use start-dashboard.sh}
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
@@ -61,7 +74,7 @@ services:
     command: ["gateway", "run"]
 
   dashboard:
-    image: hermes-agent
+    image: hermes-agent:js-dashboard-hardened
     container_name: hermes-dashboard
     restart: unless-stopped
     network_mode: host
@@ -69,8 +82,29 @@ services:
       - gateway
     volumes:
       - ~/.hermes:/opt/data
+    logging: *default-logging
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
-    # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
-    command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+      - HERMES_UID=${HERMES_UID:?HERMES_UID is required; use start-dashboard.sh}
+      - HERMES_GID=${HERMES_GID:?HERMES_GID is required; use start-dashboard.sh}
+      # Required so Hermes can resolve the configured op:// Google OIDC references.
+      - OP_SERVICE_ACCOUNT_TOKEN=${OP_SERVICE_ACCOUNT_TOKEN:?OP_SERVICE_ACCOUNT_TOKEN is required}
+    # Non-loopback binding engages Hermes's fail-closed authentication gate.
+    # Port 9119 must remain blocked from the public Internet; Caddy is the only public entry point.
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
+
+  caddy:
+    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+    container_name: hermes-caddy
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - dashboard
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *default-logging
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -126,6 +126,10 @@ _DISCOVERY_CACHE_TTL_SEC = 3600
 # provider's 5-minute lifespan so key rotation is picked up promptly).
 _JWKS_CACHE_SECONDS = 300
 
+# Distinguish an omitted optional allowlist from an explicitly configured
+# YAML null. ``None`` is a real parsed configuration value and must fail closed.
+_ALLOWED_EMAILS_UNSET = object()
+
 
 # ---------------------------------------------------------------------------
 # Skip-reason channel (mirrors the nous plugin)
@@ -184,6 +188,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        allowed_emails: list[str] | None | object = _ALLOWED_EMAILS_UNSET,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -202,6 +207,23 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # provisioned-but-blank secret can't flip us into a broken confidential
         # mode that sends an empty client_secret. Non-empty ⇒ confidential.
         self._client_secret = (client_secret or "").strip()
+        if allowed_emails is _ALLOWED_EMAILS_UNSET:
+            self._allowed_emails: set[str] | None = None
+        else:
+            if not isinstance(allowed_emails, list) or not allowed_emails:
+                raise ValueError(
+                    "allowed_emails must be a non-empty YAML list of email addresses"
+                )
+            if any(
+                not isinstance(email, str) or not email.strip()
+                for email in allowed_emails
+            ):
+                raise ValueError(
+                    "allowed_emails entries must be non-empty email address strings"
+                )
+            self._allowed_emails = {
+                email.strip().casefold() for email in allowed_emails
+            }
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -461,7 +483,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         if token_type and token_type != "bearer":
             raise ProviderError(f"unexpected token_type={token_type!r}")
 
-        claims = self._verify_id_token(id_token)
+        try:
+            claims = self._verify_id_token(id_token)
+        except InvalidCodeError as exc:
+            # Keep auth-code and refresh failure semantics distinct. An account
+            # denied during refresh must clear the session and force login,
+            # rather than escaping as an unhandled callback-code error.
+            raise bad_request_exc(str(exc)) from exc
 
         # Refresh-token rotation: prefer a freshly-issued one, else keep the
         # previous (some IDPs don't rotate). Empty string if neither — the
@@ -653,6 +681,14 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 f"ID token verification failed: {exc}{details}"
             ) from exc
 
+        if self._allowed_emails is not None:
+            email = str(claims.get("email", "") or "").strip().casefold()
+            if (
+                claims.get("email_verified") is not True
+                or email not in self._allowed_emails
+            ):
+                raise InvalidCodeError("OIDC account is not authorized")
+
         return claims
 
     # ---- internals: mapping + misc ----------------------------------------
@@ -818,6 +854,7 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    allowed_emails = oidc_cfg.get("allowed_emails", _ALLOWED_EMAILS_UNSET)
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -838,6 +875,7 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            allowed_emails=allowed_emails,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (
