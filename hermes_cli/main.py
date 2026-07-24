@@ -515,9 +515,26 @@ _apply_profile_override()
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import (
+    cli_argv_needs_external_secrets,
+    cli_argv_uses_onepassword_bootstrap_only,
+    defer_external_secret_sources,
+    load_hermes_dotenv,
+)
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+_cli_needs_external_secrets = cli_argv_needs_external_secrets(sys.argv[1:])
+_cli_uses_onepassword_bootstrap_only = cli_argv_uses_onepassword_bootstrap_only(
+    sys.argv[1:]
+)
+if not _cli_needs_external_secrets or _cli_uses_onepassword_bootstrap_only:
+    defer_external_secret_sources()
+load_hermes_dotenv(
+    project_env=PROJECT_ROOT / ".env",
+    load_external_secrets=(
+        _cli_needs_external_secrets and not _cli_uses_onepassword_bootstrap_only
+    ),
+    load_onepassword_bootstrap=_cli_needs_external_secrets,
+)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at

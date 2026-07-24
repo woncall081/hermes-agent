@@ -7,6 +7,8 @@ don't see an unexplained "credentials ✓" line when their .env is empty.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -57,18 +59,311 @@ def test_format_secret_source_suffix_generic_label_for_future_sources():
     # Future-proofing: a new secret source (e.g. "vault") should still
     # produce a sensible label without needing to edit every call site.
     env_loader._SECRET_SOURCES["OPENAI_API_KEY"] = "vault"
-    assert (
-        env_loader.format_secret_source_suffix("OPENAI_API_KEY")
-        == " (from vault)"
-    )
+    assert env_loader.format_secret_source_suffix("OPENAI_API_KEY") == " (from vault)"
 
 
 def test_format_secret_source_suffix_onepassword_uses_proper_name():
     env_loader._SECRET_SOURCES["OPENAI_API_KEY"] = "onepassword"
     assert (
-        env_loader.format_secret_source_suffix("OPENAI_API_KEY")
-        == " (from 1Password)"
+        env_loader.format_secret_source_suffix("OPENAI_API_KEY") == " (from 1Password)"
     )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--help"],
+        ["-V"],
+        ["version"],
+        ["config", "check"],
+        ["profile", "list"],
+        ["profile", "describe", "qa"],
+        ["-p", "qa", "profile", "show", "qa"],
+        ["sessions", "list"],
+        ["completion", "bash"],
+        ["skills", "list"],
+        ["plugins", "list"],
+        ["tools", "list"],
+        ["mcp", "list"],
+        ["gateway", "status"],
+        ["cron", "list"],
+        ["secrets", "onepassword", "set", "KEY", "op://Vault/Item/field"],
+        ["secrets", "onepassword", "remove", "KEY"],
+        ["secrets", "onepassword", "disable"],
+        ["secrets", "onepassword", "sync", "--help"],
+        ["-m", "config", "config", "check"],
+        ["--provider=skills", "tools", "list"],
+    ],
+)
+def test_local_cli_commands_skip_external_secret_loading(argv):
+    assert not env_loader.cli_argv_needs_external_secrets(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["chat"],
+        ["gateway", "run"],
+        ["dashboard"],
+        ["mcp", "test", "github"],
+        ["cron", "run", "job-id"],
+        ["-m", "config", "chat"],
+        ["profile", "describe", "qa", "--auto"],
+        ["profile", "describe", "--all", "--auto"],
+        ["curator", "run", "--consolidate"],
+        ["curator", "run", "--dry-run", "--consolidate"],
+        ["skills", "publish", "./my-skill"],
+        ["skills", "search", "react"],
+        ["skills", "install", "official/example"],
+        ["plugins", "install", "example"],
+        ["secrets", "onepassword", "setup"],
+        ["secrets", "onepassword", "status"],
+        ["secrets", "onepassword", "sync"],
+        ["secrets", "op", "sync"],
+        ["secrets", "1password", "sync"],
+        ["model"],
+        ["setup"],
+        ["doctor"],
+        ["dump"],
+        ["postinstall"],
+        [
+            "mcp",
+            "add",
+            "x",
+            "--command",
+            "node",
+            "--args",
+            "server.js",
+            "--help",
+        ],
+    ],
+)
+def test_runtime_cli_commands_keep_external_secret_loading(argv):
+    assert env_loader.cli_argv_needs_external_secrets(argv)
+
+
+def test_credentialed_skills_publish_loads_mocked_onepassword_in_subprocess(tmp_path):
+    marker = tmp_path / "op-calls"
+    fake_op = tmp_path / "op"
+    fake_op.write_text(
+        f"#!/bin/sh\nprintf 'read\\n' >> {marker}\nprintf 'github-token-from-op\\n'\n"
+    )
+    fake_op.chmod(0o755)
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        f"    binary_path: {fake_op}\n"
+        "    cache_ttl_seconds: 0\n"
+        "    env:\n"
+        "      GITHUB_TOKEN: 'op://Private/GitHub/token'\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(tmp_path),
+        "OP_SERVICE_ACCOUNT_TOKEN": "ops_test_bootstrap",
+        "PYTHONPATH": str(ROOT),
+    }
+    env.pop("GITHUB_TOKEN", None)
+    cli = ROOT / ".venv" / "bin" / "hermes"
+
+    local = subprocess.run(
+        [str(cli), "skills", "list"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert local.returncode == 0, local.stderr
+    assert not marker.exists()
+
+    subprocess.run(
+        [str(cli), "skills", "publish", str(tmp_path / "missing-skill")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert marker.read_text().splitlines() == ["read"]
+
+
+def test_onepassword_sync_loads_only_bootstrap_before_fresh_read(tmp_path):
+    marker = tmp_path / "op-bootstrap-seen"
+    fake_op = tmp_path / "op"
+    fake_op.write_text(
+        "#!/bin/sh\n"
+        "token=${OP_SERVICE_ACCOUNT_TOKEN:-missing}\n"
+        f"printf '%s\\n' \"$token\" >> '{marker}'\n"
+        '[ "$token" = ops_test_bootstrap ] || exit 7\n'
+        "printf 'resolved-from-op\\n'\n",
+        encoding="utf-8",
+    )
+    fake_op.chmod(0o755)
+    (tmp_path / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=ops_test_bootstrap\n", encoding="utf-8"
+    )
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        f"    binary_path: {fake_op}\n"
+        "    override_existing: false\n"
+        "    cache_ttl_seconds: 0\n"
+        "    env:\n"
+        "      TEST_PROVIDER_API_KEY: 'op://Private/Provider/key'\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(tmp_path),
+        "PYTHONPATH": str(ROOT),
+    }
+    env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
+    env.pop("TEST_PROVIDER_API_KEY", None)
+    cli = ROOT / ".venv" / "bin" / "hermes"
+
+    result = subprocess.run(
+        [str(cli), "secrets", "onepassword", "sync"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text().splitlines() == ["ops_test_bootstrap"]
+
+
+@pytest.mark.parametrize("command", ["model", "setup", "doctor", "dump", "postinstall"])
+def test_credential_aware_command_startup_loads_mocked_onepassword(command, tmp_path):
+    """Credential-aware command families must resolve external-only keys.
+
+    Importing ``hermes_cli.main`` executes the real startup classification and
+    dotenv path without invoking the interactive command body.
+    """
+    marker = tmp_path / "op-calls"
+    fake_op = tmp_path / "op"
+    fake_op.write_text(
+        f"#!/bin/sh\nprintf 'read\\n' >> {marker}\nprintf 'provider-key-from-op\\n'\n"
+    )
+    fake_op.chmod(0o755)
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        f"    binary_path: {fake_op}\n"
+        "    cache_ttl_seconds: 0\n"
+        "    env:\n"
+        "      TEST_PROVIDER_API_KEY: 'op://Private/Provider/key'\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(tmp_path),
+        "OP_SERVICE_ACCOUNT_TOKEN": "ops_test_bootstrap",
+        "PYTHONPATH": str(ROOT),
+    }
+    env.pop("TEST_PROVIDER_API_KEY", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.argv=['hermes', sys.argv[1]]; import hermes_cli.main",
+            command,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text().splitlines() == ["read"]
+
+
+def test_load_hermes_dotenv_can_skip_external_secret_sources(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def _unexpected_external_load(_home_path):
+        calls["n"] += 1
+
+    monkeypatch.setattr(
+        env_loader, "_apply_external_secret_sources", _unexpected_external_load
+    )
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=tmp_path,
+        load_external_secrets=False,
+    )
+
+    assert calls["n"] == 0
+
+
+def test_cli_deferral_blocks_later_default_loader_calls(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(env_loader, "_EXTERNAL_SECRET_SOURCES_DEFERRED", False)
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda home_path: calls.append(home_path),
+    )
+
+    env_loader.defer_external_secret_sources()
+    env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+    env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+
+    assert calls == []
+
+
+def test_load_hermes_dotenv_loads_external_secret_sources_by_default(
+    tmp_path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda home_path: calls.append(home_path),
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+
+    assert calls == [tmp_path]
+
+
+def test_external_secret_resolution_consumes_onepassword_bootstrap_token(
+    tmp_path, monkeypatch
+):
+    seen = []
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_bootstrap_only")
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda home_path: seen.append(os.environ.get("OP_SERVICE_ACCOUNT_TOKEN")),
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+
+    assert seen == ["ops_bootstrap_only"]
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
+
+
+def test_external_secret_failure_still_consumes_onepassword_bootstrap_token(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_bootstrap_only")
+
+    def fail(_home_path):
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", fail)
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        env_loader.load_hermes_dotenv(hermes_home=tmp_path)
+
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
 
 
 def test_apply_external_secret_sources_records_bitwarden_origin(tmp_path, monkeypatch):
@@ -117,9 +412,7 @@ def test_apply_external_secret_sources_noop_when_disabled(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "secrets:\n"
-        "  bitwarden:\n"
-        "    enabled: false\n",
+        "secrets:\n  bitwarden:\n    enabled: false\n",
         encoding="utf-8",
     )
 
@@ -157,6 +450,7 @@ def test_apply_external_secret_sources_dedupes_within_process(tmp_path, monkeypa
         return {"ANTHROPIC_API_KEY": "sk-ant-test"}, []
 
     import agent.secret_sources.bitwarden as bw_module
+
     monkeypatch.setattr(bw_module, "find_bws", lambda **_kw: Path("/fake/bws"))
     monkeypatch.setattr(bw_module, "fetch_bitwarden_secrets", _fake_fetch)
 
@@ -184,7 +478,9 @@ def test_apply_external_secret_sources_dedupes_within_process(tmp_path, monkeypa
     assert call_count["n"] == 2
 
 
-def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monkeypatch):
+def test_apply_external_secret_sources_records_onepassword_origin(
+    tmp_path, monkeypatch
+):
     """When the 1Password source resolves refs, applied vars end up in
     ``_SECRET_SOURCES`` labeled ``onepassword``."""
 
@@ -231,9 +527,7 @@ def test_apply_external_secret_sources_survives_non_dict_section(tmp_path, monke
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
-        "secrets:\n"
-        "  bitwarden: true\n"
-        "  onepassword: true\n",
+        "secrets:\n  bitwarden: true\n  onepassword: true\n",
         encoding="utf-8",
     )
 
@@ -263,6 +557,7 @@ def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypa
         return {}, []
 
     import agent.secret_sources.onepassword as op_module
+
     monkeypatch.setattr(op_module, "find_op", lambda *_a, **_kw: Path("/fake/op"))
     monkeypatch.setattr(op_module, "fetch_onepassword_secrets", _fake_fetch)
 

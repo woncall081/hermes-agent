@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
 from hermes_cli.secret_prompt import masked_secret_prompt
+from hermes_cli.credential_runtime import credential_write_path
 
 logger = logging.getLogger(__name__)
 
@@ -7426,7 +7427,7 @@ def save_env_value(key: str, value: str):
     # API keys / tokens must be ASCII — strip non-ASCII with a warning.
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
-    env_path = get_env_path()
+    env_path = credential_write_path(get_env_path())
 
     # On Windows, open() defaults to the system locale (cp1252) which can
     # cause OSError errno 22 on UTF-8 .env files.
@@ -7512,7 +7513,7 @@ def remove_env_value(key: str) -> bool:
         return False
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
-    env_path = get_env_path()
+    env_path = credential_write_path(get_env_path())
     if not env_path.exists():
         os.environ.pop(key, None)
         return False

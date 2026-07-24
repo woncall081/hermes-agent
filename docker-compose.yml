@@ -1,30 +1,10 @@
 #
-# docker-compose.yml for Hermes Agent
+# Hardened Joey deployment for Hermes Agent.
 #
-# Usage:
-#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
-#
-# Set HERMES_UID / HERMES_GID to the host user that owns ~/.hermes so
-# files created inside the container stay readable/writable on the host.
-# The s6-overlay stage2 hook remaps the internal `hermes` user to these
-# values via usermod/groupmod; each supervised service then drops to that
-# user via `s6-setuidgid`.
-#
-# Security notes:
-#   - The dashboard service binds to 127.0.0.1 by default. It stores API
-#     keys; exposing it on LAN without auth is unsafe. If you want remote
-#     access, use an SSH tunnel or put it behind a reverse proxy that
-#     adds authentication — do NOT pass --insecure --host 0.0.0.0.
-#   - If you override entrypoint, keep `/init` as the first command in
-#     the chain (or let docker use the image's default ENTRYPOINT,
-#     which is `["/init", "/opt/hermes/docker/main-wrapper.sh"]`).
-#     `/init` is s6-overlay's PID 1 — it runs the cont-init.d scripts
-#     (chown, profile reconcile, dashboard toggle) and sets up the
-#     supervision tree before any service starts. Bypassing it skips
-#     all of that setup and the gateway will not work correctly.
-#   - The gateway's API server is off unless you uncomment API_SERVER_KEY
-#     and API_SERVER_HOST. See docs/user-guide/api-server.md before doing
-#     this on an internet-facing host.
+# Prerequisite: hermes-credential-runtime.service must be active. It exposes
+# the 1Password bootstrap and writable runtime credentials from a protected,
+# non-swappable tmpfs. No plaintext credential is supplied through Compose or
+# Docker metadata.
 #
 x-logging: &default-logging
   driver: json-file
@@ -38,64 +18,173 @@ services:
     image: hermes-agent:js-dashboard-hardened
     container_name: hermes
     restart: unless-stopped
-    # Keep a runaway browser, build, or subagent from exhausting this
-    # 4-vCPU / 8-GiB host. CPU is throttled only when the container is busy.
     cpus: 3.0
     mem_limit: 6g
     mem_reservation: 2g
     pids_limit: 2048
+    ulimits:
+      core: 0
     network_mode: host
+    depends_on:
+      op-connect-api:
+        condition: service_started
     volumes:
-      - ~/.hermes:/opt/data
+      - /home/hermes/.hermes:/opt/data
+      - /run/hermes-runtime:/run/hermes-runtime
+      - /run/hermes-runtime/bootstrap/op-service-account-token:/run/secrets/hermes-op-service-account-token:ro
+      - type: bind
+        source: /run/hermes-runtime/bootstrap/op-connect-token
+        target: /run/secrets/hermes-op-connect-token
+        read_only: true
+        bind:
+          create_host_path: false
     logging: *default-logging
     environment:
       - HERMES_UID=${HERMES_UID:?HERMES_UID is required; use start-dashboard.sh}
       - HERMES_GID=${HERMES_GID:?HERMES_GID is required; use start-dashboard.sh}
-      # To expose the OpenAI-compatible API server beyond localhost,
-      # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
-      # - API_SERVER_HOST=0.0.0.0
-      # - API_SERVER_KEY=${API_SERVER_KEY}
-      # Microsoft Teams — uncomment and fill in to enable Teams gateway.
-      # Register your bot at https://dev.botframework.com/ to get these values.
-      # - TEAMS_CLIENT_ID=${TEAMS_CLIENT_ID}
-      # - TEAMS_CLIENT_SECRET=${TEAMS_CLIENT_SECRET}
-      # - TEAMS_TENANT_ID=${TEAMS_TENANT_ID}
-      # - TEAMS_ALLOWED_USERS=${TEAMS_ALLOWED_USERS}
-      # - TEAMS_PORT=${TEAMS_PORT:-3978}
-      # Google Chat — uncomment and fill in to enable the Google Chat gateway.
-      # See website/docs/user-guide/messaging/google_chat.md for the full setup.
-      # The SA JSON path must point to a file mounted into the container —
-      # add a volume entry above (e.g. ``- ~/.hermes/google-chat-sa.json:/secrets/google-chat-sa.json:ro``)
-      # then set GOOGLE_CHAT_SERVICE_ACCOUNT_JSON to that mount path.
-      # - GOOGLE_CHAT_PROJECT_ID=${GOOGLE_CHAT_PROJECT_ID}
-      # - GOOGLE_CHAT_SUBSCRIPTION_NAME=${GOOGLE_CHAT_SUBSCRIPTION_NAME}
-      # - GOOGLE_CHAT_SERVICE_ACCOUNT_JSON=${GOOGLE_CHAT_SERVICE_ACCOUNT_JSON}
-      # - GOOGLE_CHAT_ALLOWED_USERS=${GOOGLE_CHAT_ALLOWED_USERS}
+      - HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE=/run/secrets/hermes-op-service-account-token
+      - OP_CONNECT_HOST=http://127.0.0.1:8080
+      - HERMES_OP_CONNECT_TOKEN_FILE=/run/secrets/hermes-op-connect-token
+      - HERMES_SECRET_ENV_ALLOWLIST=MCP_GITHUB_API_KEY,DEEPGRAM_API_KEY
     command: ["gateway", "run"]
+
+  # Dedicated, profile-scoped Chromium endpoint for the Samudio Agency
+  # executive assistant. CDP listens on loopback only.
+  executive-assistant-browser:
+    image: hermes-agent:js-dashboard-hardened
+    container_name: hermes-executive-assistant-browser
+    restart: unless-stopped
+    network_mode: host
+    user: "${HERMES_UID:?HERMES_UID is required}:${HERMES_GID:?HERMES_GID is required}"
+    cpus: 1.0
+    mem_limit: 1g
+    mem_reservation: 256m
+    pids_limit: 512
+    shm_size: 256m
+    ulimits:
+      core: 0
+    volumes:
+      - /home/hermes/.hermes:/opt/data
+    logging: *default-logging
+    environment:
+      - HOME=/opt/data/profiles/agency/browser
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        exec /opt/data/browser-binaries/chromium-current/chrome-linux64/chrome
+        --headless=new
+        --no-sandbox
+        --disable-dev-shm-usage
+        --password-store=basic
+        --remote-debugging-address=127.0.0.1
+        --remote-debugging-port=9223
+        --user-data-dir=/opt/data/profiles/agency/browser/chromium
+        --no-first-run
+        --no-default-browser-check
+        about:blank
 
   dashboard:
     image: hermes-agent:js-dashboard-hardened
     container_name: hermes-dashboard
-    restart: unless-stopped
+    # Bound restart count prevents a bad credential or a 1Password rate limit
+    # from creating a provider-read restart storm.
+    restart: "on-failure:3"
     network_mode: host
     depends_on:
       - gateway
+    ulimits:
+      core: 0
     volumes:
-      - ~/.hermes:/opt/data
+      - /home/hermes/.hermes:/opt/data
+      - /run/hermes-runtime/bootstrap/op-service-account-token:/run/secrets/hermes-op-service-account-token:ro
+      - type: bind
+        source: /run/hermes-runtime/bootstrap/op-connect-token
+        target: /run/secrets/hermes-op-connect-token
+        read_only: true
+        bind:
+          create_host_path: false
     logging: *default-logging
     environment:
       - HERMES_UID=${HERMES_UID:?HERMES_UID is required; use start-dashboard.sh}
       - HERMES_GID=${HERMES_GID:?HERMES_GID is required; use start-dashboard.sh}
-      # Required so Hermes can resolve the configured op:// Google OIDC references.
-      - OP_SERVICE_ACCOUNT_TOKEN=${OP_SERVICE_ACCOUNT_TOKEN:?OP_SERVICE_ACCOUNT_TOKEN is required}
-    # Non-loopback binding engages Hermes's fail-closed authentication gate.
-    # Port 9119 must remain blocked from the public Internet; Caddy is the only public entry point.
+      - HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE=/run/secrets/hermes-op-service-account-token
+      - OP_CONNECT_HOST=http://127.0.0.1:8080
+      - HERMES_OP_CONNECT_TOKEN_FILE=/run/secrets/hermes-op-connect-token
+      - HERMES_SECRET_ENV_ALLOWLIST=HERMES_DASHBOARD_OIDC_CLIENT_ID,HERMES_DASHBOARD_OIDC_CLIENT_SECRET
     command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
+    entrypoint: ["/opt/hermes/docker/onepassword-entrypoint.sh"]
+
+  op-connect-api:
+    image: 1password/connect-api:1.8.2@sha256:e915c0c843972f02b0e7e2de502bda8bd4a092288b3f1866098a857bd715a281
+    container_name: hermes-op-connect-api
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 512m
+    mem_reservation: 128m
+    pids_limit: 256
+    ulimits:
+      core: 0
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      op-connect-sync:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks: ["op-connect-bus"]
+    environment:
+      - OP_SESSION=/home/opuser/.op/1password-credentials.json
+      - OP_BUS_PORT=11223
+      - OP_BUS_PEERS=op-connect-sync:11223
+      - OP_LOG_LEVEL=info
+    volumes:
+      - type: bind
+        source: /run/hermes-runtime/bootstrap/op-connect-credentials
+        target: /home/opuser/.op/1password-credentials.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: op_connect_data
+        target: /home/opuser/.op/data
+    logging: *default-logging
+
+  op-connect-sync:
+    image: 1password/connect-sync:1.8.2@sha256:6297ca6136c0f0fb096bc64c49e1bc8df2aab35282ebff8c7bb60745ef176d0d
+    container_name: hermes-op-connect-sync
+    restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 512m
+    mem_reservation: 128m
+    pids_limit: 256
+    ulimits:
+      core: 0
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks: ["op-connect-bus", "op-connect-egress"]
+    environment:
+      - OP_SESSION=/home/opuser/.op/1password-credentials.json
+      - OP_BUS_PORT=11223
+      - OP_BUS_PEERS=op-connect-api:11223
+      - OP_LOG_LEVEL=info
+    volumes:
+      - type: bind
+        source: /run/hermes-runtime/bootstrap/op-connect-credentials
+        target: /home/opuser/.op/1password-credentials.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: op_connect_data
+        target: /home/opuser/.op/data
+    logging: *default-logging
 
   caddy:
     image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     container_name: hermes-caddy
     restart: unless-stopped
+    ulimits:
+      core: 0
     network_mode: host
     depends_on:
       - dashboard
@@ -105,6 +194,12 @@ services:
       - caddy_config:/config
     logging: *default-logging
 
+networks:
+  op-connect-bus:
+    internal: true
+  op-connect-egress: {}
+
 volumes:
+  op_connect_data:
   caddy_data:
   caddy_config:

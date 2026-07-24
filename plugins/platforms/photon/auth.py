@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from hermes_cli.credential_runtime import credential_write_path
+
 try:
     import httpx
 except ImportError:  # pragma: no cover - httpx is a hermes dependency
@@ -107,7 +109,7 @@ def _load_auth() -> Dict[str, Any]:
 
 
 def _save_auth(data: Dict[str, Any]) -> None:
-    path = _auth_json_path()
+    path = credential_write_path(_auth_json_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as fh:

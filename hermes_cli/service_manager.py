@@ -684,6 +684,9 @@ class S6ServiceManager:
         # start`, etc. See `_gateway_command_inner` for the matching
         # guard.
         lines.append("export HERMES_S6_SUPERVISED_CHILD=1")
+        # The managed bootstrap remains a read-only runtime file. The child
+        # sees only its path; only short-lived `op` subprocesses receive the
+        # credential value.
         # ``--replace`` makes the supervised gateway authoritative for its
         # profile's HERMES_HOME. Without it, a gateway started OUTSIDE s6
         # (a stray ``hermes gateway run`` from a shell, an agent action, or

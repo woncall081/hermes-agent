@@ -1,0 +1,12 @@
+[Unit]
+Description=Non-swappable Hermes runtime credential filesystem
+Before=hermes-credential-runtime.service docker.service
+
+[Mount]
+What=tmpfs
+Where=/run/hermes-runtime
+Type=tmpfs
+Options=rw,nosuid,nodev,noexec,noswap,mode=0711,size=16M
+
+[Install]
+WantedBy=multi-user.target

@@ -44,6 +44,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -72,6 +73,9 @@ _OP_RUN_TIMEOUT = 30
 # the value to the child as OP_SERVICE_ACCOUNT_TOKEN, which is what `op` itself
 # looks for.
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
+_TOKEN_FILE_ENV = "HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE"
+_CONNECT_TOKEN_FILE_ENV = "HERMES_OP_CONNECT_TOKEN_FILE"
+_ENV_ALLOWLIST_ENV = "HERMES_SECRET_ENV_ALLOWLIST"
 
 # Strip whole ANSI CSI sequences (colour, cursor moves, line erases) from any
 # `op` diagnostic we surface — not just the lone ESC byte — so a control
@@ -169,18 +173,22 @@ def _validate_references(
     return valid, warnings
 
 
-def _auth_fingerprint(token_env: str) -> str:
+def _auth_fingerprint(
+    token_env: str,
+    *,
+    token_value: str = "",
+    connect_token_value: str = "",
+) -> str:
     """SHA-256 prefix over the auth material `op` would use.
 
-    Folds in the service-account token, ``OP_ACCOUNT``, and *all*
-    ``OP_SESSION_*`` vars (the names `op` actually exports for interactive
-    sessions — ``OP_SESSION_<account_shorthand>``).  Signing out and into a
-    different identity therefore changes the cache key, so a value cached under
-    a previous identity is never served under a new one.  Never logged or
-    displayed; the raw token never leaves this hash.
+    Folds in Connect or service-account auth, ``OP_ACCOUNT``, and *all*
+    ``OP_SESSION_*`` vars. Changing authentication or endpoint therefore
+    partitions cached values. Raw credentials never leave this hash.
     """
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
+        f"token={token_value or os.environ.get(token_env, '')}",
+        f"connect_token={connect_token_value}",
+        f"connect_host={os.environ.get('OP_CONNECT_HOST', '')}",
         f"account={os.environ.get('OP_ACCOUNT', '')}",
     ]
     for key in sorted(os.environ):
@@ -223,12 +231,17 @@ def find_op(binary_path: str = "") -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _scrub(text: str) -> str:
-    """Remove ANSI control sequences and trim, for safe message surfacing."""
-    return _ANSI_CSI_RE.sub("", text).replace("\x1b", "").strip()
+def _scrub(text: str, sensitive_values: Tuple[str, ...] = ()) -> str:
+    """Remove controls and known child-auth values before surfacing messages."""
+    cleaned = _ANSI_CSI_RE.sub("", text).replace("\x1b", "")
+    for value in sorted({value for value in sensitive_values if value}, key=len, reverse=True):
+        cleaned = cleaned.replace(value, "[REDACTED]")
+    return cleaned.strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
+def _op_child_env(
+    token_value: str, connect_token_value: str = ""
+) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
@@ -239,12 +252,70 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     for key, val in os.environ.items():
         if key.startswith("OP_SESSION_"):
             env[key] = val
-    # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user
-    # configured Hermes to source it from, so normalize to that name here.
-    if token_value:
+    # Connect is authoritative when configured. Never pass both bearer types.
+    if connect_token_value:
+        env["OP_CONNECT_TOKEN"] = connect_token_value
+        env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
+    elif token_value:
+        # `op` always reads the canonical name regardless of the configured
+        # Hermes source variable.
+        env.pop("OP_CONNECT_TOKEN", None)
+        env.pop("OP_CONNECT_HOST", None)
         env["OP_SERVICE_ACCOUNT_TOKEN"] = token_value
     env["NO_COLOR"] = "1"
     return env
+
+
+def _service_account_token(token_env: str) -> str:
+    """Read a managed bootstrap token without adding it to the parent env."""
+    token = os.environ.get(token_env, "").strip()
+    if token:
+        return token
+    raw_path = os.environ.get(_TOKEN_FILE_ENV, "").strip()
+    if not raw_path:
+        return ""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(raw_path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError("1Password bootstrap credential is not a regular file")
+        if st.st_uid not in {0, os.geteuid()} or stat.S_IMODE(st.st_mode) & 0o077:
+            raise RuntimeError("1Password bootstrap credential ownership or mode is unsafe")
+        token = os.read(fd, 16384).decode("utf-8").strip()
+        if os.read(fd, 1):
+            raise RuntimeError("1Password bootstrap credential is unexpectedly large")
+    finally:
+        os.close(fd)
+    if not re.fullmatch(r"ops_[A-Za-z0-9_]+", token):
+        raise RuntimeError("1Password bootstrap credential has an invalid format")
+    return token
+
+
+def _connect_token() -> str:
+    """Read a Connect bearer without adding it to the parent process env."""
+    raw_path = os.environ.get(_CONNECT_TOKEN_FILE_ENV, "").strip()
+    if not raw_path:
+        token = os.environ.get("OP_CONNECT_TOKEN", "").strip()
+        if token and not re.fullmatch(r"[A-Za-z0-9._~-]+", token):
+            raise RuntimeError("1Password Connect credential has an invalid format")
+        return token
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(raw_path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError("1Password Connect credential is not a regular file")
+        if st.st_uid not in {0, os.geteuid()} or stat.S_IMODE(st.st_mode) & 0o077:
+            raise RuntimeError("1Password Connect credential ownership or mode is unsafe")
+        token = os.read(fd, 16384).decode("utf-8").strip()
+        if os.read(fd, 1):
+            raise RuntimeError("1Password Connect credential is unexpectedly large")
+    finally:
+        os.close(fd)
+    if not token or not re.fullmatch(r"[A-Za-z0-9._~-]+", token):
+        raise RuntimeError("1Password Connect credential has an invalid format")
+    return token
 
 
 def _run_op_read(
@@ -253,6 +324,7 @@ def _run_op_read(
     *,
     account: str = "",
     token_value: str = "",
+    connect_token_value: str = "",
 ) -> str:
     """Resolve a single ``op://`` reference to its value.
 
@@ -267,10 +339,11 @@ def _run_op_read(
     # an `op` flag even if validation is ever loosened.
     cmd += ["--", reference]
 
+    child_env = _op_child_env(token_value, connect_token_value)
     try:
         proc = subprocess.run(  # noqa: S603 — op path is user-trusted, argv list
             cmd,
-            env=_op_child_env(token_value),
+            env=child_env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -285,7 +358,17 @@ def _run_op_read(
         raise RuntimeError(f"failed to invoke op: {exc}") from exc
 
     if proc.returncode != 0:
-        err = _scrub(proc.stderr or "")[:200]
+        sensitive_values = (
+            token_value,
+            connect_token_value,
+            *(
+                value
+                for key, value in child_env.items()
+                if key in {"OP_SERVICE_ACCOUNT_TOKEN", "OP_CONNECT_TOKEN"}
+                or key.startswith("OP_SESSION_")
+            ),
+        )
+        err = _scrub(proc.stderr or "", sensitive_values)[:200]
         if err:
             raise RuntimeError(f"op read failed for {reference!r}: {err}")
         raise RuntimeError(
@@ -332,9 +415,19 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    connect_host = os.environ.get("OP_CONNECT_HOST", "").strip()
+    connect_token_value = _connect_token() if connect_host else ""
+    if connect_host and not connect_token_value:
+        raise RuntimeError(
+            "1Password Connect host is configured but no Connect token is available"
+        )
+    token_value = "" if connect_host else _service_account_token(token_env)
     cache_key: _CacheKey = (
-        _auth_fingerprint(token_env),
+        _auth_fingerprint(
+            token_env,
+            token_value=token_value,
+            connect_token_value=connect_token_value,
+        ),
         account or "",
         str(home_path) if home_path is not None else "",
         _refs_fingerprint(valid),
@@ -363,7 +456,11 @@ def fetch_onepassword_secrets(
     for name in sorted(valid):
         try:
             secrets[name] = _run_op_read(
-                op, valid[name], account=account, token_value=token_value
+                op,
+                valid[name],
+                account=account,
+                token_value=token_value,
+                connect_token_value=connect_token_value,
             )
         except RuntimeError as exc:
             warnings.append(str(exc))
@@ -513,7 +610,7 @@ class OnePasswordSource(SecretSource):
         token_env = _DEFAULT_TOKEN_ENV
         if isinstance(cfg, dict):
             token_env = str(cfg.get("service_account_token_env") or token_env)
-        return frozenset({token_env})
+        return frozenset({token_env, "OP_CONNECT_TOKEN"})
 
     def config_schema(self) -> dict:
         return {
@@ -553,9 +650,15 @@ class OnePasswordSource(SecretSource):
         valid, warnings = _validate_references(
             env_map if isinstance(env_map, dict) else None
         )
+        raw_allowlist = os.environ.get(_ENV_ALLOWLIST_ENV, "").strip()
+        if raw_allowlist:
+            allowed = {
+                name.strip() for name in raw_allowlist.split(",") if name.strip()
+            }
+            valid = {name: ref for name, ref in valid.items() if name in allowed}
         result.warnings.extend(warnings)
         if not valid:
-            if not warnings:
+            if not warnings and not raw_allowlist:
                 result.error = (
                     "secrets.onepassword.enabled is true but the env: map is "
                     "empty.  Add ENV_VAR: op://vault/item/field entries."

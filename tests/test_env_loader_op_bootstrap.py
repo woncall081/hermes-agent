@@ -66,7 +66,7 @@ def test_op_env_autoloads_bootstrap_token_in_cron_context(tmp_path, monkeypatch)
 
     env_loader.load_hermes_dotenv(hermes_home=home)
 
-    assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "test-token"
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
 
 
 def test_op_env_does_not_override_existing_token(tmp_path, monkeypatch):
@@ -82,8 +82,37 @@ def test_op_env_does_not_override_existing_token(tmp_path, monkeypatch):
 
     env_loader.load_hermes_dotenv(hermes_home=home)
 
-    # override=False AND the explicit guard both protect the live token.
-    assert os.environ["OP_SERVICE_ACCOUNT_TOKEN"] == "live-token"
+    # Existing bootstrap material is consumed after source application too.
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
+
+
+def test_named_profile_uses_root_bootstrap_file(tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "agency"
+    profile.mkdir(parents=True)
+    (root / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=root-token\n", encoding="utf-8"
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=profile)
+
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
+
+
+def test_named_profile_ignores_profile_local_bootstrap_file(tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "agency"
+    profile.mkdir(parents=True)
+    (root / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=root-token\n", encoding="utf-8"
+    )
+    (profile / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=profile-token\n", encoding="utf-8"
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=profile)
+
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
 
 
 def test_missing_op_env_is_a_noop(tmp_path):
@@ -93,6 +122,21 @@ def test_missing_op_env_is_a_noop(tmp_path):
     (home / ".env").write_text("FOO=bar\n", encoding="utf-8")
 
     env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ.get("OP_SERVICE_ACCOUNT_TOKEN") is None
+
+
+def test_local_only_load_does_not_import_bootstrap_token(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=test-token\n", encoding="utf-8"
+    )
+
+    env_loader.load_hermes_dotenv(
+        hermes_home=home,
+        load_external_secrets=False,
+    )
 
     assert os.environ.get("OP_SERVICE_ACCOUNT_TOKEN") is None
 
@@ -120,9 +164,7 @@ def _seed_openrouter_token(monkeypatch, dotenv_value, environ_value):
     else:
         monkeypatch.setenv("OPENROUTER_API_KEY", environ_value)
     # Never treat the synthetic source as suppressed.
-    monkeypatch.setattr(
-        "hermes_cli.auth.is_source_suppressed", lambda _p, _s: False
-    )
+    monkeypatch.setattr("hermes_cli.auth.is_source_suppressed", lambda _p, _s: False)
 
     entries: list = []
     changed, sources = credential_pool._seed_from_env("openrouter", entries)

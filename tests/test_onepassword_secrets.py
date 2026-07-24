@@ -17,7 +17,6 @@ from unittest import mock
 
 import pytest
 
-
 # Make the worktree importable without depending on the installed wheel.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -40,6 +39,11 @@ def _clean_op_env(monkeypatch):
         if key.startswith("OP_SESSION_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("OP_CONNECT_HOST", raising=False)
+    monkeypatch.delenv("OP_CONNECT_TOKEN", raising=False)
+    monkeypatch.delenv("HERMES_OP_CONNECT_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("HERMES_SECRET_ENV_ALLOWLIST", raising=False)
     monkeypatch.delenv("OP_ACCOUNT", raising=False)
     yield
 
@@ -104,6 +108,170 @@ def test_fetch_happy_path(monkeypatch, tmp_path):
     )
     assert secrets == {"OPENAI_API_KEY": "sk-abc", "ANTHROPIC_API_KEY": "sk-ant-xyz"}
     assert warnings == []
+
+
+def test_fetch_reads_service_account_token_from_protected_file(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    token_file = tmp_path / "bootstrap-token"
+    token_file.write_text("ops_test_token\n")
+    token_file.chmod(0o400)
+    monkeypatch.setenv("HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE", str(token_file))
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["child_token"] = kwargs["env"]["OP_SERVICE_ACCOUNT_TOKEN"]
+        assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
+        return _ok("resolved")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+    )
+    assert secrets == {"K": "resolved"}
+    assert warnings == []
+    assert captured["child_token"] == "ops_test_token"
+
+
+def test_fetch_rejects_permissive_service_account_token_file(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    token_file = tmp_path / "bootstrap-token"
+    token_file.write_text("ops_test_token\n")
+    token_file.chmod(0o644)
+    monkeypatch.setenv("HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE", str(token_file))
+    with pytest.raises(RuntimeError, match="ownership or mode"):
+        op.fetch_onepassword_secrets(
+            references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+        )
+
+
+def test_fetch_reads_connect_token_from_protected_file_and_suppresses_service_account(
+    monkeypatch, tmp_path
+):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    token_file = tmp_path / "connect-token"
+    token_file.write_text("header.payload.signature\n")
+    token_file.chmod(0o400)
+    monkeypatch.setenv("OP_CONNECT_HOST", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HERMES_OP_CONNECT_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("OP_CONNECT_TOKEN", "ambient.override.must.not.win")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_fallback_must_not_escape")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        assert os.environ["OP_CONNECT_TOKEN"] == "ambient.override.must.not.win"
+        return _ok("resolved")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+    )
+
+    assert secrets == {"K": "resolved"}
+    assert warnings == []
+    assert captured["env"]["OP_CONNECT_HOST"] == "http://127.0.0.1:8080"
+    assert captured["env"]["OP_CONNECT_TOKEN"] == "header.payload.signature"
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in captured["env"]
+    assert "OP_CONNECT_TOKEN" in op.OnePasswordSource().protected_env_vars({})
+
+
+def test_fetch_rejects_permissive_connect_token_file(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    token_file = tmp_path / "connect-token"
+    token_file.write_text("header.payload.signature\n")
+    token_file.chmod(0o644)
+    monkeypatch.setenv("OP_CONNECT_HOST", "http://127.0.0.1:8080")
+    monkeypatch.setenv("HERMES_OP_CONNECT_TOKEN_FILE", str(token_file))
+
+    with pytest.raises(RuntimeError, match="Connect credential ownership or mode"):
+        op.fetch_onepassword_secrets(
+            references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+        )
+
+
+def test_fetch_requires_connect_token_when_connect_host_is_configured(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_CONNECT_HOST", "http://127.0.0.1:8080")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_fallback_must_not_escape")
+
+    with pytest.raises(RuntimeError, match="Connect host is configured but no Connect token"):
+        op.fetch_onepassword_secrets(
+            references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+        )
+
+
+def test_service_account_child_env_removes_ambient_connect_bearer(monkeypatch):
+    monkeypatch.setenv("OP_CONNECT_HOST", "http://stale-connect.invalid")
+    monkeypatch.setenv("OP_CONNECT_TOKEN", "stale.connect.bearer")
+
+    child = op._op_child_env("ops_service_account_only")
+
+    assert child["OP_SERVICE_ACCOUNT_TOKEN"] == "ops_service_account_only"
+    assert "OP_CONNECT_TOKEN" not in child
+    assert "OP_CONNECT_HOST" not in child
+
+
+def test_op_error_redacts_auth_values_from_child_stderr(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    service_token = "ops_sensitive_service_token"
+    connect_token = "sensitive.connect.token"
+
+    def fake_run(cmd, **kwargs):
+        return _err(
+            1,
+            f"service={service_token} connect={connect_token} session=session-secret",
+        )
+
+    monkeypatch.setenv("OP_SESSION_TEST", "session-secret")
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as caught:
+        op._run_op_read(
+            fake_op,
+            "op://V/I/F",
+            token_value=service_token,
+            connect_token_value=connect_token,
+        )
+
+    message = str(caught.value)
+    assert service_token not in message
+    assert connect_token not in message
+    assert "session-secret" not in message
+    assert message.count("[REDACTED]") == 3
+
+
+def test_source_allowlist_limits_provider_reads(monkeypatch, tmp_path):
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_test_token")
+    monkeypatch.setenv("HERMES_SECRET_ENV_ALLOWLIST", "ONLY")
+    monkeypatch.setattr(op, "find_op", lambda _configured="": "/usr/bin/op")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="allowed-value\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = op.OnePasswordSource().fetch(
+        {
+            "env": {
+                "ONLY": "op://Vault/Allowed/password",
+                "BLOCKED": "op://Vault/Blocked/password",
+            },
+            "cache_ttl_seconds": 0,
+        },
+        tmp_path,
+    )
+
+    assert result.error is None
+    assert result.secrets == {"ONLY": "allowed-value"}
+    assert len(calls) == 1
+    assert "op://Vault/Allowed/password" in calls[0]
 
 
 def test_fetch_uses_option_terminator_and_account(monkeypatch, tmp_path):

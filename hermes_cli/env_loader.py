@@ -38,6 +38,182 @@ _SECRET_SOURCES: dict[str, str] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
+# Exact local-only CLI operations. Unknown commands and unknown subcommands
+# deliberately load secrets: a false positive costs one cache lookup, while a
+# false negative can break a credentialed command.
+_LOCAL_CLI_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "backup": frozenset({"*"}),
+    "bundles": frozenset({"*"}),
+    "checkpoints": frozenset({"*"}),
+    "completion": frozenset({"*"}),
+    "config": frozenset({"*"}),
+    "curator": frozenset({
+        "status",
+        "usage",
+        "pause",
+        "resume",
+        "pin",
+        "unpin",
+        "restore",
+        "list-archived",
+        "archive",
+        "prune",
+        "backup",
+        "rollback",
+    }),
+    "debug": frozenset({"*"}),
+    "fallback": frozenset({"*"}),
+    "hooks": frozenset({"*"}),
+    "import": frozenset({"*"}),
+    "insights": frozenset({"*"}),
+    "kanban": frozenset({"*"}),
+    "logs": frozenset({"*"}),
+    "migrate": frozenset({"*"}),
+    "moa": frozenset({"*"}),
+    "pets": frozenset({"*"}),
+    "profile": frozenset({"list", "show", "use", "current", "describe"}),
+    "project": frozenset({"*"}),
+    "prompt-size": frozenset({"*"}),
+    "security": frozenset({"*"}),
+    "sessions": frozenset({"*"}),
+    "status": frozenset({"*"}),
+    "uninstall": frozenset({"*"}),
+    "update": frozenset({"*"}),
+    "skills": frozenset({"list"}),
+    "plugins": frozenset({"list"}),
+    "tools": frozenset({"list", "enable", "disable", "post-setup"}),
+    "mcp": frozenset({"list", "ls", "remove", "rm", "catalog"}),
+    "gateway": frozenset({
+        "start",
+        "stop",
+        "restart",
+        "status",
+        "install",
+        "uninstall",
+        "list",
+        "migrate-legacy",
+    }),
+    "cron": frozenset({
+        "create",
+        "edit",
+        "list",
+        "status",
+        "pause",
+        "resume",
+        "remove",
+    }),
+    "proxy": frozenset({"status", "providers"}),
+}
+_LOCAL_CLI_BARE_COMMANDS = frozenset({"curator", "skills", "plugins", "tools"})
+_ONEPASSWORD_CLI_ALIASES = frozenset({"onepassword", "op", "1password"})
+_ONEPASSWORD_BOOTSTRAP_COMMANDS = frozenset({"setup", "status", "sync"})
+_GLOBAL_OPTIONS_WITH_VALUE = frozenset({
+    "-p",
+    "--profile",
+    "-z",
+    "--oneshot",
+    "-m",
+    "--model",
+    "--provider",
+    "-t",
+    "--toolsets",
+    "-r",
+    "--resume",
+    "-s",
+    "--skills",
+    "--usage-file",
+    "-c",
+    "--continue",
+})
+_EXTERNAL_SECRET_SOURCES_DEFERRED = False
+
+
+def _cli_command_tokens(argv: list[str]) -> tuple[str | None, list[str]]:
+    """Extract top-level command/rest while skipping known global options."""
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in _GLOBAL_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        if any(
+            option.startswith("--") and arg.startswith(f"{option}=")
+            for option in _GLOBAL_OPTIONS_WITH_VALUE
+        ):
+            index += 1
+            continue
+        if arg == "--":
+            index += 1
+            break
+        if arg.startswith("-"):
+            index += 1
+            continue
+        return arg, argv[index + 1 :]
+    if index < len(argv):
+        return argv[index], argv[index + 1 :]
+    return None, []
+
+
+def cli_argv_uses_onepassword_bootstrap_only(argv: list[str]) -> bool:
+    """Return whether a direct 1Password command needs only its bootstrap token."""
+    command, rest = _cli_command_tokens(argv)
+    if command != "secrets" or any(
+        token in {"-h", "--help", "-V", "--version"} for token in argv
+    ):
+        return False
+    tokens = [token for token in rest if token and not token.startswith("-")]
+    return (
+        len(tokens) >= 2
+        and tokens[0] in _ONEPASSWORD_CLI_ALIASES
+        and tokens[1] in _ONEPASSWORD_BOOTSTRAP_COMMANDS
+    )
+
+
+def cli_argv_needs_external_secrets(argv: list[str]) -> bool:
+    """Return whether a CLI invocation may need external secret resolution.
+
+    Help/version output never executes a command. Otherwise only exact,
+    proven-local command/subcommand combinations skip external sources.
+    """
+    command, rest = _cli_command_tokens(argv)
+
+    # ``mcp add --args`` is argparse.REMAINDER: everything after the boundary
+    # belongs to the child process.  Child ``--help``/``--version`` flags must
+    # not suppress Hermes credential loading.  All other argv is Hermes-owned.
+    hermes_argv = argv
+    if command == "mcp" and rest[:1] == ["add"] and "--args" in rest:
+        hermes_argv = argv[: argv.index("--args")]
+
+    if any(token in {"-h", "--help", "-V", "--version"} for token in hermes_argv):
+        return False
+    if command == "version":
+        return False
+    if command is None:
+        return True
+    if command == "secrets":
+        return cli_argv_uses_onepassword_bootstrap_only(argv)
+
+    allowed = _LOCAL_CLI_SUBCOMMANDS.get(command)
+    if not allowed:
+        return True
+    if "*" in allowed:
+        return False
+
+    subcommand = next((arg for arg in rest if arg and not arg.startswith("-")), None)
+    if subcommand is None:
+        return command not in _LOCAL_CLI_BARE_COMMANDS
+    if subcommand not in allowed:
+        return True
+    if command == "profile" and subcommand == "describe" and "--auto" in rest:
+        return True
+    return False
+
+
+def defer_external_secret_sources() -> None:
+    """Prevent later default dotenv loads from resolving external sources."""
+    global _EXTERNAL_SECRET_SOURCES_DEFERRED
+    _EXTERNAL_SECRET_SOURCES_DEFERRED = True
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -144,7 +320,7 @@ def _sanitize_loaded_credentials() -> None:
             "  This usually means the key was copy-pasted from a PDF, "
             "rich-text editor, or web page that substituted lookalike\n"
             "  Unicode glyphs for ASCII letters. If authentication fails "
-            "(e.g. \"API key not valid\"), re-copy the key from the\n"
+            '(e.g. "API key not valid"), re-copy the key from the\n'
             "  provider's dashboard and run `hermes setup` (or edit the "
             ".env file in a plain-text editor).",
             file=sys.stderr,
@@ -198,6 +374,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         sanitized = _sanitize_env_lines(stripped)
         if sanitized != original:
             import tempfile
+
             fd, tmp = tempfile.mkstemp(
                 dir=str(path.parent), suffix=".tmp", prefix=".env_"
             )
@@ -217,10 +394,23 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def _bootstrap_op_env_paths(home_path: Path) -> tuple[Path, ...]:
+    """Return the sole approved 1Password bootstrap path for this home.
+
+    Named profiles live at ``<root>/profiles/<name>`` and must use only the
+    protected shared-root bootstrap token. Other homes use their own file.
+    """
+    if home_path.parent.name == "profiles":
+        return (home_path.parent.parent / ".op.env",)
+    return (home_path / ".op.env",)
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
+    load_external_secrets: bool = True,
+    load_onepassword_bootstrap: bool | None = None,
 ) -> list[Path]:
     """Load Hermes environment files with user config taking precedence.
 
@@ -256,15 +446,32 @@ def load_hermes_dotenv(
     #   EnvironmentFile=-/path/to/.hermes/.op.env
     # in their gateway unit, which takes precedence (override=False below
     # ensures .op.env never clobbers a token already in the environment).
-    op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+    external_sources_enabled = (
+        load_external_secrets and not _EXTERNAL_SECRET_SOURCES_DEFERRED
+    )
+    if load_onepassword_bootstrap is None:
+        load_onepassword_bootstrap = external_sources_enabled
+    if load_onepassword_bootstrap:
+        for op_env in _bootstrap_op_env_paths(home_path):
+            if os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+                break
+            if op_env.exists():
+                _load_dotenv_with_fallback(op_env, override=False)
 
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
 
-    _apply_external_secret_sources(home_path)
+    if external_sources_enabled:
+        try:
+            _apply_external_secret_sources(home_path)
+        finally:
+            # The service-account token is bootstrap material, not a runtime
+            # credential. Long-running processes need it only while their
+            # mapped op:// references are resolved at startup. Remove it even
+            # when resolution fails so later tools and subprocesses cannot
+            # inherit the 1Password bootstrap identity.
+            os.environ.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
     _apply_managed_env()
 
     return loaded

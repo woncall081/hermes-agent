@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
+
+from hermes_cli.credential_runtime import credential_write_path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -1111,7 +1113,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
-    auth_file = target_path if target_path is not None else _auth_file_path()
+    logical_auth_file = target_path if target_path is not None else _auth_file_path()
+    auth_file = credential_write_path(logical_auth_file)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1156,7 +1159,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    return auth_file
+    return logical_auth_file
 
 
 def _load_provider_state_with_source(

@@ -680,6 +680,15 @@ def test_render_run_script_resets_home_before_exec() -> None:
     assert "exec s6-setuidgid hermes hermes -p coder gateway run --replace" in run_text
 
 
+def test_render_run_script_does_not_export_onepassword_bootstrap() -> None:
+    run_text = S6ServiceManager._render_run_script("coder", {})
+
+    assert "load-op-bootstrap" not in run_text
+    assert "hermes_load_op_bootstrap" not in run_text
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in run_text
+    assert "exec s6-setuidgid hermes hermes -p coder gateway run --replace" in run_text
+
+
 def test_render_run_script_uses_replace_to_take_over_stale_holder() -> None:
     """NS-505: the supervised gateway must exec ``gateway run --replace``.
 
