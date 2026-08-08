@@ -14,6 +14,8 @@ STATIC = (
     (Path("/home/hermes/.hermes/auth.json"), RUNTIME / "auth.json"),
     (Path("/home/hermes/.hermes/profiles/be/auth.json"), RUNTIME / "profiles/be/auth.json"),
     (Path("/home/hermes/.hermes/profiles/fe/auth.json"), RUNTIME / "profiles/fe/auth.json"),
+    (Path("/home/hermes/.hermes/home/.codex/auth.json"), RUNTIME / "codex/auth.json"),
+    (Path("/home/hermes/.hermes/home/.codex/config.toml"), RUNTIME / "codex/config.toml"),
     (
         Path("/home/hermes/.hermes/profiles/agency/google_client_secret.json"),
         RUNTIME / "profiles/agency/google_client_secret.json",

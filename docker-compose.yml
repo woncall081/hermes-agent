@@ -14,175 +14,182 @@ x-logging: &default-logging
 
 services:
   gateway:
-    build: .
-    image: hermes-agent:js-dashboard-hardened
+    build:
+      context: .
+      dockerfile: deployment/direct-secrets/Dockerfile
+    image: hermes-agent:direct-secrets-v1
     container_name: hermes
     restart: unless-stopped
+    # Sized for the 16 GiB host with explicit headroom for Docker and the OS.
+    # Heavy native builds should still be serialized to reduce latency and I/O pressure.
     cpus: 3.0
-    mem_limit: 6g
-    mem_reservation: 2g
-    pids_limit: 2048
+    mem_limit: 8g
+    mem_reservation: 4g
+    memswap_limit: 8960m
+    pids_limit: 1024
     ulimits:
       core: 0
     network_mode: host
-    depends_on:
-      op-connect-api:
-        condition: service_started
     volumes:
       - /home/hermes/.hermes:/opt/data
-      - /run/hermes-runtime:/run/hermes-runtime
-      - /run/hermes-runtime/bootstrap/op-service-account-token:/run/secrets/hermes-op-service-account-token:ro
+      # Keep legacy /opt/data symlinks working while mounting the boot-time
+      # 1Password snapshot directly into Hermes. The service-account token is
+      # never mounted; these are read-only RAM files only.
       - type: bind
-        source: /run/hermes-runtime/bootstrap/op-connect-token
-        target: /run/secrets/hermes-op-connect-token
+        source: /run/hermes-runtime/.env
+        target: /run/hermes-runtime/.env
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/auth.json
+        target: /run/hermes-runtime/auth.json
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/mcp-tokens
+        target: /run/hermes-runtime/mcp-tokens
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/profiles
+        target: /run/hermes-runtime/profiles
+        read_only: false
+        bind:
+          create_host_path: false
+      # The whole Codex home is host-backed non-swappable tmpfs. This keeps
+      # OAuth refresh, temp files, and atomic replacement off persistent HOME.
+      - type: bind
+        source: /run/hermes-runtime/codex
+        target: /run/hermes-runtime/codex
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/secrets/current/github/token
+        target: /run/secrets/github-token
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/secrets/current/devops/digitalocean-token
+        target: /run/secrets/digitalocean-token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/secrets/current/devops/ssh-private-key
+        target: /run/secrets/ssh-private-key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/secrets/current/agency/logins.json
+        target: /run/secrets/agency-logins.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/hermes-secure/devops-broker-state/known_hosts
+        target: /run/secrets/ssh-known-hosts
+        read_only: false
+        bind:
+          create_host_path: false
+      - /home/hermes/.hermes/hermes-connect-rollout-20260724:/opt/data/hermes-connect-rollout-20260724:ro
+    tmpfs:
+      - /run/hermes-runtime:rw,nosuid,nodev,noexec,size=64k,mode=0700,uid=1000,gid=1000
     logging: *default-logging
     environment:
       - HERMES_UID=${HERMES_UID:?HERMES_UID is required; use start-dashboard.sh}
       - HERMES_GID=${HERMES_GID:?HERMES_GID is required; use start-dashboard.sh}
-      - HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE=/run/secrets/hermes-op-service-account-token
-      - OP_CONNECT_HOST=http://127.0.0.1:8080
-      - HERMES_OP_CONNECT_TOKEN_FILE=/run/secrets/hermes-op-connect-token
-      - HERMES_SECRET_ENV_ALLOWLIST=MCP_GITHUB_API_KEY,DEEPGRAM_API_KEY
+      - HERMES_GITHUB_TOKEN_FILE=/run/secrets/github-token
+      - HERMES_DIGITALOCEAN_TOKEN_FILE=/run/secrets/digitalocean-token
+      - HERMES_SSH_PRIVATE_KEY_SOURCE_FILE=/run/secrets/ssh-private-key
+      - HERMES_SSH_KNOWN_HOSTS_FILE=/run/secrets/ssh-known-hosts
+      - HERMES_AGENCY_LOGINS_FILE=/run/secrets/agency-logins.json
+      - CODEX_HOME=/run/hermes-runtime/codex
     command: ["gateway", "run"]
 
-  # Dedicated, profile-scoped Chromium endpoint for the Samudio Agency
-  # executive assistant. CDP listens on loopback only.
-  executive-assistant-browser:
-    image: hermes-agent:js-dashboard-hardened
-    container_name: hermes-executive-assistant-browser
-    restart: unless-stopped
-    network_mode: host
-    user: "${HERMES_UID:?HERMES_UID is required}:${HERMES_GID:?HERMES_GID is required}"
-    cpus: 1.0
-    mem_limit: 1g
-    mem_reservation: 256m
-    pids_limit: 512
-    shm_size: 256m
-    ulimits:
-      core: 0
-    volumes:
-      - /home/hermes/.hermes:/opt/data
-    logging: *default-logging
-    environment:
-      - HOME=/opt/data/profiles/agency/browser
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        exec /opt/data/browser-binaries/chromium-current/chrome-linux64/chrome
-        --headless=new
-        --no-sandbox
-        --disable-dev-shm-usage
-        --password-store=basic
-        --remote-debugging-address=127.0.0.1
-        --remote-debugging-port=9223
-        --user-data-dir=/opt/data/profiles/agency/browser/chromium
-        --no-first-run
-        --no-default-browser-check
-        about:blank
-
   dashboard:
-    image: hermes-agent:js-dashboard-hardened
+    build:
+      context: .
+      dockerfile: deployment/dashboard-scoped-secrets/Dockerfile
+    image: hermes-dashboard:direct-secrets-v1
     container_name: hermes-dashboard
-    # Bound restart count prevents a bad credential or a 1Password rate limit
-    # from creating a provider-read restart storm.
-    restart: "on-failure:3"
+    # Restart after planned host reboots; bootstrap still fails closed on bad snapshots.
+    restart: unless-stopped
+    cpus: 0.75
+    mem_limit: 1536m
+    mem_reservation: 256m
+    memswap_limit: 1792m
+    pids_limit: 256
     network_mode: host
     depends_on:
-      - gateway
+      gateway:
+        condition: service_started
     ulimits:
       core: 0
+    # Keep runtime symlinks traversable by the UID-1000 dashboard process
+    # without exposing the gateway runtime. The private tmpfs is otherwise
+    # empty; only OAuth state is nested into it. In particular,
+    # /run/hermes-runtime/.env and API-key/password material are not mounted.
+    tmpfs:
+      - /run/hermes-runtime:rw,nosuid,nodev,noexec,size=64k,mode=0700,uid=1000,gid=1000
     volumes:
       - /home/hermes/.hermes:/opt/data
-      - /run/hermes-runtime/bootstrap/op-service-account-token:/run/secrets/hermes-op-service-account-token:ro
       - type: bind
-        source: /run/hermes-runtime/bootstrap/op-connect-token
-        target: /run/secrets/hermes-op-connect-token
+        source: /opt/hermes-secure/dashboard/config.yaml
+        target: /opt/data/config.yaml
         read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/secrets/current/dashboard/oidc.json
+        target: /run/secrets/dashboard-oidc.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/secrets/current/github/token
+        target: /run/secrets/github-token
+        read_only: true
+        bind:
+          create_host_path: false
+      # Provider credentials and MCP tokens are OAuth artifacts, not
+      # password/API-key material. Mount only the paths that the dashboard's
+      # /opt/data symlinks resolve through; do not expose the rest of the
+      # gateway runtime directory.
+      - type: bind
+        source: /run/hermes-runtime/auth.json
+        target: /run/hermes-runtime/auth.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/hermes-runtime/mcp-tokens
+        target: /run/hermes-runtime/mcp-tokens
+        read_only: false
         bind:
           create_host_path: false
     logging: *default-logging
     environment:
       - HERMES_UID=${HERMES_UID:?HERMES_UID is required; use start-dashboard.sh}
       - HERMES_GID=${HERMES_GID:?HERMES_GID is required; use start-dashboard.sh}
-      - HERMES_OP_SERVICE_ACCOUNT_TOKEN_FILE=/run/secrets/hermes-op-service-account-token
-      - OP_CONNECT_HOST=http://127.0.0.1:8080
-      - HERMES_OP_CONNECT_TOKEN_FILE=/run/secrets/hermes-op-connect-token
-      - HERMES_SECRET_ENV_ALLOWLIST=HERMES_DASHBOARD_OIDC_CLIENT_ID,HERMES_DASHBOARD_OIDC_CLIENT_SECRET
+      - HERMES_DASHBOARD_OIDC_FILE=/run/secrets/dashboard-oidc.json
+      - HERMES_GITHUB_TOKEN_FILE=/run/secrets/github-token
     command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
-    entrypoint: ["/opt/hermes/docker/onepassword-entrypoint.sh"]
-
-  op-connect-api:
-    image: 1password/connect-api:1.8.2@sha256:e915c0c843972f02b0e7e2de502bda8bd4a092288b3f1866098a857bd715a281
-    container_name: hermes-op-connect-api
-    restart: unless-stopped
-    cpus: 0.5
-    mem_limit: 512m
-    mem_reservation: 128m
-    pids_limit: 256
-    ulimits:
-      core: 0
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    depends_on:
-      op-connect-sync:
-        condition: service_started
-    ports:
-      - "127.0.0.1:8080:8080"
-    networks: ["op-connect-bus"]
-    environment:
-      - OP_SESSION=/home/opuser/.op/1password-credentials.json
-      - OP_BUS_PORT=11223
-      - OP_BUS_PEERS=op-connect-sync:11223
-      - OP_LOG_LEVEL=info
-    volumes:
-      - type: bind
-        source: /run/hermes-runtime/bootstrap/op-connect-credentials
-        target: /home/opuser/.op/1password-credentials.json
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: volume
-        source: op_connect_data
-        target: /home/opuser/.op/data
-    logging: *default-logging
-
-  op-connect-sync:
-    image: 1password/connect-sync:1.8.2@sha256:6297ca6136c0f0fb096bc64c49e1bc8df2aab35282ebff8c7bb60745ef176d0d
-    container_name: hermes-op-connect-sync
-    restart: unless-stopped
-    cpus: 0.5
-    mem_limit: 512m
-    mem_reservation: 128m
-    pids_limit: 256
-    ulimits:
-      core: 0
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    networks: ["op-connect-bus", "op-connect-egress"]
-    environment:
-      - OP_SESSION=/home/opuser/.op/1password-credentials.json
-      - OP_BUS_PORT=11223
-      - OP_BUS_PEERS=op-connect-api:11223
-      - OP_LOG_LEVEL=info
-    volumes:
-      - type: bind
-        source: /run/hermes-runtime/bootstrap/op-connect-credentials
-        target: /home/opuser/.op/1password-credentials.json
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: volume
-        source: op_connect_data
-        target: /home/opuser/.op/data
-    logging: *default-logging
 
   caddy:
     image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     container_name: hermes-caddy
     restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 128m
+    mem_reservation: 32m
+    memswap_limit: 192m
+    pids_limit: 128
     ulimits:
       core: 0
     network_mode: host
@@ -194,12 +201,6 @@ services:
       - caddy_config:/config
     logging: *default-logging
 
-networks:
-  op-connect-bus:
-    internal: true
-  op-connect-egress: {}
-
 volumes:
-  op_connect_data:
   caddy_data:
   caddy_config:

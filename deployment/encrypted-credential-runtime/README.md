@@ -7,6 +7,7 @@ This deployment removes persistent plaintext Hermes service credentials while pr
 - `systemd-creds` encrypts the allowlisted credential files at `/etc/credstore.encrypted/` with the host key. The droplet has no TPM, so this protects against accidental plaintext exposure and backups, not a root/offline attacker who also obtains the host key.
 - `hermes-credential-runtime.service` decrypts into systemd's root-only credential mount. systemd verified this mount as `tmpfs` with `noswap` on the target host.
 - Mutable OAuth and `.env` files are copied into `/run/hermes-runtime`, a dedicated writable `tmpfs,noswap` mount, and the persistent paths become symlinks to the runtime copies.
+- Codex `auth.json` and the generated app-server `config.toml` are encrypted as `codex-auth` and `codex-config`, materialized under `/run/hermes-runtime/codex`, and exposed to the gateway through `CODEX_HOME`. This keeps token refreshes and Codex's atomic file replacement inside tmpfs. The legacy persistent file references are runtime symlinks only.
 - `hermes-credential-sync.path` re-encrypts mutable runtime files after changes and on service stop. It never writes plaintext outside `/run`.
 - The 1Password service-account token is not copied into the writable runtime. It remains root-only in the systemd credential directory and is bind-mounted into only the gateway and dashboard containers.
 - Root bootstrap wrappers inject the token only into credential-dependent service startup. After source application, `load_hermes_dotenv()` removes `OP_SERVICE_ACCOUNT_TOKEN` before the long-running agent or dashboard continues.
@@ -24,6 +25,24 @@ The deployment records the previous image ID and creates a rollback compose file
 2. Restart `hermes-credential-runtime.service`.
 3. Recreate only `hermes-gateway` and `hermes-dashboard`.
 4. Verify service health and scan for forbidden persistent plaintext/caches.
+
+## Codex runtime enablement
+
+Before first encryption, run the supported `/codex-runtime codex_app_server`
+switch for an allowlisted profile while `CODEX_HOME` points at the existing
+Codex home. This creates the managed `config.toml` (including the Hermes tool
+callback) without copying OAuth material. Encrypt and verify `codex-auth` and
+`codex-config`, restart the credential runtime, replace the two persistent
+regular files with runtime symlinks, and recreate the gateway with
+`CODEX_HOME=/run/hermes-runtime/codex`.
+
+The writer-path audit must verify that the gateway and spawned Codex app-server
+inherit that `CODEX_HOME`, that both files resolve to the `/run/hermes-runtime`
+tmpfs device, and that no regular `auth.json` remains below the persistent
+Codex home. A cold-boot test must stop the stack, clear the volatile mount via
+the mount lifecycle, restart the credential runtime and Docker, then exercise
+an allowlisted profile and its Kanban callback before the deployment is
+accepted.
 
 ## Acceptance checks
 

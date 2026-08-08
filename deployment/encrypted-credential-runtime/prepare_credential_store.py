@@ -17,6 +17,8 @@ ENTRIES = (
     ("default-auth", Path("/home/hermes/.hermes/auth.json")),
     ("be-auth", Path("/home/hermes/.hermes/profiles/be/auth.json")),
     ("fe-auth", Path("/home/hermes/.hermes/profiles/fe/auth.json")),
+    ("codex-auth", Path("/home/hermes/.hermes/home/.codex/auth.json")),
+    ("codex-config", Path("/home/hermes/.hermes/home/.codex/config.toml")),
     ("agency-google-client-secret", Path("/home/hermes/.hermes/profiles/agency/google_client_secret.json")),
     ("agency-google-token", Path("/home/hermes/.hermes/profiles/agency/google_token.json")),
 )
