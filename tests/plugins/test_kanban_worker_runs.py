@@ -327,8 +327,13 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
         "VALUES (?, 'running', ?, ?, ?, ?)",
         (task_id, lock, future, worker_pid, int(time.time())),
     )
+    run_id = cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET current_run_id=? WHERE id=?",
+        (run_id, task_id),
+    )
     conn.commit()
-    return task_id, cur.lastrowid
+    return task_id, run_id
 
 
 def test_terminate_run_404_unknown_id(client):
@@ -373,9 +378,18 @@ def test_terminate_run_ok(client, monkeypatch):
     # Capture signal calls so we don't actually SIGTERM a random PID.
     sent = []
 
-    def _fake_terminate(pid, prev_lock, *, signal_fn=None):
-        sent.append((pid, prev_lock))
-        return {"signal": "SIGTERM", "delivered": True}
+    def _fake_terminate(
+        pid, prev_lock, *, signal_fn=None, task_id=None, run_id=None,
+        ownership_still_current=None, ownership_conn=None,
+    ):
+        sent.append((pid, prev_lock, task_id, run_id))
+        return {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "root_identity_verified": True,
+            "surviving_pids": [],
+        }
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", _fake_terminate)
 
@@ -386,7 +400,7 @@ def test_terminate_run_ok(client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body == {"ok": True, "run_id": run_id, "task_id": task_id}
-    assert sent == [(33333, sent[0][1])]
+    assert sent == [(33333, sent[0][1], task_id, run_id)]
     assert sent[0][1] is not None  # claim_lock was non-null
 
     # Task is back to ready, claim cleared.
@@ -401,6 +415,71 @@ def test_terminate_run_ok(client, monkeypatch):
     assert row["status"] == "ready"
     assert row["claim_lock"] is None
     assert row["worker_pid"] is None
+
+
+def test_terminate_run_binds_reclaim_to_requested_run(client, monkeypatch):
+    """The endpoint must not let a stale run request reclaim its replacement."""
+    conn = kb.connect()
+    try:
+        task_id, run_id = _setup_running_task_with_run(
+            conn, title="exact-run", assignee="jane", worker_pid=33334,
+        )
+    finally:
+        conn.close()
+
+    seen = []
+
+    def _reclaim(conn, requested_task_id, *, reason=None, expected_run_id=None):
+        seen.append((requested_task_id, reason, expected_run_id))
+        return False
+
+    monkeypatch.setattr(kb, "reclaim_task", _reclaim)
+    r = client.post(
+        f"/api/plugins/kanban/runs/{run_id}/terminate",
+        json={"reason": "operator abort"},
+    )
+    assert r.status_code == 409
+    assert seen == [(task_id, "operator abort", run_id)]
+
+
+def test_reclaim_expected_run_rejects_replacement_before_signaling(
+    client, monkeypatch,
+):
+    """A run-A request must not discover or signal replacement run B."""
+    conn = kb.connect()
+    try:
+        task_id, run_a = _setup_running_task_with_run(
+            conn, title="replacement", assignee="jane", worker_pid=33335,
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+            "ended_at=? WHERE id=?",
+            (int(time.time()), run_a),
+        )
+        lock_b = secrets.token_hex(8)
+        cur = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?)",
+            (task_id, lock_b, int(time.time()) + 3600, 33336, int(time.time())),
+        )
+        run_b = cur.lastrowid
+        conn.execute(
+            "UPDATE tasks SET claim_lock=?, worker_pid=?, current_run_id=? WHERE id=?",
+            (lock_b, 33336, run_b, task_id),
+        )
+        conn.commit()
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("replacement worker must not be inspected or signaled")
+
+        monkeypatch.setattr(kb, "_terminate_reclaimed_worker", _boom)
+        assert kb.reclaim_task(conn, task_id, expected_run_id=run_a) is False
+        task = kb.get_task(conn, task_id)
+        assert task.current_run_id == run_b
+        assert task.worker_pid == 33336
+    finally:
+        conn.close()
 
 
 def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):

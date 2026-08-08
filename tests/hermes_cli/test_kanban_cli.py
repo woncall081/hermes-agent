@@ -368,11 +368,25 @@ def test_kanban_not_gateway_only():
 # reclaim + reassign CLI smoke tests
 # ---------------------------------------------------------------------------
 
-def test_run_slash_reclaim_running_task(kanban_home):
+def test_run_slash_reclaim_running_task(kanban_home, monkeypatch):
     import re
     import time
     import secrets
     from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "root_identity_verified": True,
+            "root_identity_lost": False,
+            "ownership_changed": False,
+            "surviving_pids": [],
+        },
+    )
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)

@@ -376,6 +376,74 @@ def test_pid_alive_helper():
     assert not kb._pid_alive(2 ** 30)
 
 
+def test_task_owned_pids_uses_psutil_fallback_outside_linux(monkeypatch):
+    """Detached exact-token discovery must not depend exclusively on /proc."""
+    import psutil
+
+    monkeypatch.setattr(kb.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        lambda attrs=None: [
+            SimpleNamespace(pid=53101),
+            SimpleNamespace(pid=53102),
+            SimpleNamespace(pid=53103),
+        ],
+    )
+    monkeypatch.setattr(
+        kb,
+        "_process_matches_run",
+        lambda pid, task_id, claim_lock, run_id, board_db_path: (
+            pid in {53101, 53103}
+        ),
+    )
+
+    assert kb._task_owned_pids(
+        "task-a",
+        claim_lock="host:claim-a",
+        run_id=7,
+        board_db_path="/tmp/psutil-fallback-board.db",
+        exclude=[53103],
+    ) == [53101]
+
+
+def test_terminate_reclaimed_worker_pidfd_revalidates_start_token(monkeypatch):
+    """PID reuse between discovery and pidfd open must never receive a signal."""
+    import hermes_cli.kanban_db as _kb
+
+    tokens = iter([1.0, 1.0, 2.0])
+    sent = []
+    closed = []
+    monkeypatch.setattr(_kb.sys, "platform", "linux")
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *a, **k: True)
+    monkeypatch.setattr(_kb, "_process_tree_pids", lambda _pid: [])
+    monkeypatch.setattr(_kb, "_task_owned_pids", lambda *a, **k: [])
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        _kb, "_process_start_token", lambda _pid: next(tokens, 2.0),
+    )
+    monkeypatch.setattr(_kb, "_pidfd_open", lambda _pid: 88)
+    monkeypatch.setattr(_kb.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(
+        _kb,
+        "_pidfd_send_signal",
+        lambda *args: sent.append(args),
+    )
+
+    result = _kb._terminate_reclaimed_worker(
+        62001,
+        f"{_kb._claimer_id().split(':', 1)[0]}:claim",
+        task_id="task-pidfd-reuse",
+        run_id=9,
+        board_db_path="/tmp/pidfd-reuse-board.db",
+        grace_polls=0,
+    )
+
+    assert sent == []
+    assert closed == [88]
+    assert result["identity_reused"] is True
+
+
 def test_pid_alive_detects_darwin_zombie(monkeypatch):
     monkeypatch.setattr(kb.sys, "platform", "darwin")
     monkeypatch.setattr(kb.os, "kill", lambda pid, sig: None)
@@ -966,10 +1034,15 @@ def test_terminate_reclaimed_worker_owns_descendants_and_tagged_orphans(monkeypa
     monkeypatch.setattr(
         _kb,
         "_process_matches_run",
-        lambda pid, task_id, claim_lock, run_id: pid != sanitized_descendant_pid,
+        lambda pid, task_id, claim_lock, run_id, board_db_path: (
+            pid != sanitized_descendant_pid
+        ),
     )
 
-    def _owned(task_id, *, claim_lock=None, run_id=None, exclude=None):
+    def _owned(
+        task_id, *, claim_lock=None, run_id=None, board_db_path=None,
+        exclude=None,
+    ):
         assert task_id == "t_owned"
         assert claim_lock.endswith(":worker")
         assert run_id == 77
@@ -991,6 +1064,7 @@ def test_terminate_reclaimed_worker_owns_descendants_and_tagged_orphans(monkeypa
         signal_fn=_signal,
         task_id="t_owned",
         run_id=77,
+        board_db_path="/tmp/owned-processes-board.db",
         grace_polls=2,
     )
 
@@ -1008,9 +1082,8 @@ def test_terminate_reclaimed_worker_owns_descendants_and_tagged_orphans(monkeypa
     assert replacement_pid in alive
 
 
-def test_terminate_reclaimed_worker_non_linux_root_fallback(monkeypatch):
-    """Platforms without /proc preserve recorded-root containment."""
-    import signal
+def test_terminate_reclaimed_worker_non_linux_reused_root_fails_closed(monkeypatch):
+    """Non-Linux hosts must not trust a recorded PID without exact identity."""
     import hermes_cli.kanban_db as _kb
 
     root_pid = 51101
@@ -1039,22 +1112,28 @@ def test_terminate_reclaimed_worker_non_linux_root_fallback(monkeypatch):
         grace_polls=1,
     )
 
-    term_pids = {pid for pid, sig in signals if sig == signal.SIGTERM}
-    assert result["terminated"] is True
-    assert term_pids == {root_pid, child_pid}
+    assert signals == []
+    assert result["termination_attempted"] is False
+    assert result["root_identity_verified"] is False
+    assert alive == {root_pid, child_pid}
 
 
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
+    alive = {os.getpid()}
+
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
+        alive.discard(pid)
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
+    # Model a live exact-run process that exits immediately after SIGTERM.
     import hermes_cli.kanban_db as _kb
     original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    original_matches = _kb._process_matches_run
+    _kb._pid_alive = lambda pid: pid in alive
+    _kb._process_matches_run = lambda pid, *a, **k: pid == os.getpid()
 
     try:
         conn = kb.connect()
@@ -1098,13 +1177,16 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+        _kb._process_matches_run = original_matches
 
 
 def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
     """Two timed_out outcomes on the same task/profile trip the retry guard."""
     import hermes_cli.kanban_db as _kb
     original_alive = _kb._pid_alive
+    original_matches = _kb._process_matches_run
     _kb._pid_alive = lambda pid: False
+    _kb._process_matches_run = lambda *a, **k: True
 
     def _age_active_run(conn, tid):
         old_started = int(time.time()) - 30
@@ -1140,6 +1222,7 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+        _kb._process_matches_run = original_matches
 
 
 def test_max_runtime_none_means_no_cap(kanban_home):
@@ -1190,6 +1273,7 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
     monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *a, **k: True)
 
     conn = kb.connect()
     try:
@@ -1577,10 +1661,20 @@ def test_run_summary_falls_back_to_result(kanban_home):
         conn.close()
 
 
-def test_multiple_attempts_preserved_as_runs(kanban_home):
+def test_multiple_attempts_preserved_as_runs(kanban_home, monkeypatch):
     """Crash / retry / complete flow produces one run per attempt, all
     visible in list_runs in chronological order."""
     import hermes_cli.kanban_db as _kb
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *a, **k: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": True,
+            "root_identity_verified": True,
+        },
+    )
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -1636,6 +1730,10 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [tid]
 
+        # Automatic retry is fail-closed when root cleanup cannot be proven.
+        # Simulate the operator inspecting resources and explicitly releasing
+        # the capability block before the replacement attempt.
+        assert kb.unblock_task(conn, tid) is True
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
@@ -1677,6 +1775,10 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [tid]
 
+        # Automatic retry is fail-closed when root cleanup cannot be proven.
+        # Simulate the operator inspecting resources and explicitly releasing
+        # the capability block before the replacement attempt.
+        assert kb.unblock_task(conn, tid) is True
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
         assert run2.id != run1.id
@@ -2084,11 +2186,13 @@ def test_archive_of_ready_task_does_not_create_spurious_run(kanban_home):
         conn.close()
 
 
-def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
-    """Dashboard drag-drop running->ready must close the active run.
+def test_dashboard_direct_status_change_off_running_is_refused(kanban_home):
+    """Direct writes must not release ownership beside a live worker.
 
-    Importing _set_status_direct directly to simulate the PATCH handler
-    without spinning up FastAPI.
+    The dashboard PATCH handler owns the safe ``running -> ready`` path and
+    must route it through ``reclaim_task``. This lower-level helper refuses
+    every direct transition off running so sibling/bulk callers cannot clear
+    a claim without first proving exact-run process cleanup.
     """
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
@@ -2100,15 +2204,13 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
         assert open_run.ended_at is None
         prev_run_id = open_run.id
 
-        # Simulate yanking the worker back to the queue.
-        assert _set_status_direct(conn, tid, "ready") is True
+        assert _set_status_direct(conn, tid, "ready") is False
 
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
-        assert task.current_run_id is None
-        closed = kb.get_run(conn, prev_run_id)
-        assert closed.ended_at is not None
-        assert closed.outcome == "reclaimed"
+        assert task.status == "running"
+        assert task.current_run_id == prev_run_id
+        assert task.claim_lock is not None
+        assert kb.get_run(conn, prev_run_id).ended_at is None
     finally:
         conn.close()
 
@@ -4237,6 +4339,11 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        monkeypatch.setattr(
+            _kb,
+            "_process_matches_run",
+            lambda pid, *a, **k: pid == 12345,
+        )
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -4315,11 +4422,23 @@ def test_reassign_task_refuses_running_without_reclaim_first(kanban_home):
         conn.close()
 
 
-def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
+def test_reassign_task_with_reclaim_first_switches_profile(
+    kanban_home, monkeypatch,
+):
     """With ``reclaim_first=True``, a running task is reclaimed and
     reassigned in one operation."""
     import time
     import secrets
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *a, **k: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": True,
+            "root_identity_verified": True,
+        },
+    )
     conn = kb.connect()
     try:
         t = kb.create_task(conn, title="switch me", assignee="orig")
@@ -4371,6 +4490,7 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
     monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *a, **k: True)
 
     conn = kb.connect()
     try:
@@ -4424,6 +4544,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
     monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *a, **k: True)
 
     conn = kb.connect()
     try:
@@ -4502,7 +4623,8 @@ def test_detect_crashed_workers_increments_counter(kanban_home):
 
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 1
-        assert task.status == "ready"
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
     finally:
         conn.close()
 
@@ -4551,24 +4673,23 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
 
         events = kb.list_events(conn, tid)
         kinds = [e.kind for e in events]
-        assert "protocol_violation" in kinds, (
-            f"expected 'protocol_violation' event, got {kinds}"
-        )
+        assert "resource_cleanup_unverified" in kinds
+        assert "protocol_violation" not in kinds
+        assert "gave_up" not in kinds
         # The ``crashed`` event would be misleading here — the worker
         # didn't crash, it returned 0.
         assert "crashed" not in kinds, (
             f"should NOT emit 'crashed' event on clean exit, got {kinds}"
         )
-        assert "gave_up" in kinds, (
-            f"breaker should trip, expected 'gave_up' event, got {kinds}"
-        )
     finally:
         conn.close()
 
 
-def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
-    """A worker that exited non-zero (real error / crash) uses the
-    normal counter path — one failure doesn't trip the breaker.
+def test_detect_crashed_workers_nonzero_exit_quarantines_unverified_cleanup(
+    kanban_home,
+):
+    """A nonzero crash increments failure count but cannot auto-retry when
+    cleanup after root loss is unprovable.
     """
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
@@ -4589,22 +4710,127 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
             _kb._pid_alive = original_alive
 
         task = kb.get_task(conn, tid)
-        assert task.status == "ready", (
-            f"single non-zero crash shouldn't auto-block, got {task.status}"
+        assert task.status == "blocked", (
+            f"unverified non-zero crash cleanup must quarantine, got {task.status}"
         )
+        assert task.block_kind == "capability"
         assert task.consecutive_failures == 1
         events = kb.list_events(conn, tid)
         kinds = [e.kind for e in events]
-        assert "crashed" in kinds
+        assert "resource_cleanup_unverified" in kinds
+        assert "crashed" not in kinds
         assert "protocol_violation" not in kinds
     finally:
         conn.close()
 
 
-def test_reclaim_task_clears_failure_counter(kanban_home):
+def test_reclaim_task_defers_when_owned_process_survives(kanban_home, monkeypatch):
+    """Manual reclaim must not release a claim beside a surviving worker."""
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="still alive", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb._set_worker_pid(conn, tid, 62002)
+        before = kb.get_task(conn, tid)
+        assert before is not None
+        assert before.claim_expires is not None
+
+        monkeypatch.setattr(
+            _kb,
+            "_terminate_reclaimed_worker",
+            lambda *args, **kwargs: {
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": False,
+                "surviving_pids": [62002],
+            },
+        )
+
+        assert kb.reclaim_task(conn, tid, reason="operator abort") is False
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == before.claim_lock
+        assert task.worker_pid == 62002
+        assert task.claim_expires is not None
+        assert task.claim_expires > before.claim_expires
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.ended_at is None
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "reclaim_deferred" in kinds
+        assert "reclaimed" not in kinds
+    finally:
+        conn.close()
+
+
+def test_reclaim_task_second_tick_quarantines_lost_sanitized_survivor(
+    kanban_home, monkeypatch,
+):
+    """A prior survivor cannot become dispatchable when later undiscoverable."""
+    import hermes_cli.kanban_db as _kb
+
+    results = iter(
+        [
+            {
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": False,
+                "root_identity_verified": True,
+                "surviving_pids": [62003],
+            },
+            {
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": True,
+                "root_identity_verified": False,
+                "surviving_pids": [],
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: next(results),
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="lost survivor", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb._set_worker_pid(conn, tid, 62001)
+
+        assert kb.reclaim_task(conn, tid, reason="first attempt") is False
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        assert first.status == "running"
+
+        assert kb.reclaim_task(conn, tid, reason="second attempt") is False
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        kinds = [event.kind for event in kb.list_events(conn, tid)]
+        assert "resource_cleanup_unverified" in kinds
+        assert "reclaimed" not in kinds
+
+
+def test_reclaim_task_clears_failure_counter(kanban_home, monkeypatch):
     """Operator reclaim wipes the counter so the next retry gets a fresh
-    budget."""
+    budget when exact-run cleanup is verified."""
     import secrets
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *a, **k: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": True,
+            "root_identity_verified": True,
+        },
+    )
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="stuck", assignee="worker")
@@ -4644,6 +4870,18 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *a, **k: True)
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *a, **k: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": True,
+            "root_identity_verified": True,
+            "surviving_pids": [],
+        },
+    )
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
@@ -4672,6 +4910,9 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
 
 def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch):
     """dispatch_once with stale_timeout_seconds=0 skips stale detection."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *a, **k: True)
     # Use os.getpid() so _pid_alive → True, preventing detect_crashed_workers
     # from reclaiming. Only stale detection (disabled via timeout=0) is tested.
 

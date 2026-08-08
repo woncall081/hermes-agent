@@ -1822,9 +1822,22 @@ def test_board_warnings_cleared_after_clean_completion(client):
     assert parent_dict.get("warnings") is None
 
 
-def test_reclaim_endpoint_releases_running_claim(client):
+def test_reclaim_endpoint_releases_running_claim(client, monkeypatch):
     """POST /tasks/<id>/reclaim drops the claim, returns ok, and emits
     a manual reclaimed event."""
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "root_identity_verified": True,
+            "root_identity_lost": False,
+            "ownership_changed": False,
+            "surviving_pids": [],
+        },
+    )
     import secrets
     conn = kb.connect()
     try:
@@ -1929,9 +1942,24 @@ def test_reassign_endpoint_409_on_running_without_reclaim(client):
     assert r.status_code == 409
 
 
-def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
+def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(
+    client, monkeypatch,
+):
     """With reclaim_first=true, a running task is reclaimed+reassigned in
     one call."""
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "root_identity_verified": True,
+            "root_identity_lost": False,
+            "ownership_changed": False,
+            "surviving_pids": [],
+        },
+    )
     import secrets
     conn = kb.connect()
     try:

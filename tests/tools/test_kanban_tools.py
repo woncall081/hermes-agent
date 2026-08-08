@@ -897,6 +897,56 @@ def test_heartbeat_extends_claim_expires(worker_env):
     )
 
 
+def test_heartbeat_tool_does_not_partially_extend_replacement(
+    worker_env, monkeypatch,
+):
+    """The tool rejects stale run A before changing same-claim run B."""
+    import time as _time
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        old = kb.get_task(conn, worker_env)
+        assert old is not None
+        old_run_id = old.current_run_id
+        lock = old.claim_lock
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET status = 'reclaimed', "
+                "outcome = 'reclaimed', ended_at = ?, claim_lock = NULL, "
+                "claim_expires = NULL WHERE id = ?",
+                (int(_time.time()), old_run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, current_run_id = NULL WHERE id = ?",
+                (worker_env,),
+            )
+        replacement = kb.claim_task(conn, worker_env, claimer=lock)
+        assert replacement is not None
+        task_before = kb.get_task(conn, worker_env)
+        run_before = kb.get_run(conn, replacement.current_run_id)
+        assert task_before is not None
+        assert run_before is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(old_run_id))
+    out = kt._handle_heartbeat({"note": "stale old worker"})
+    payload = json.loads(out)
+    assert payload.get("ok") is not True
+    assert "claim/run ownership changed" in payload.get("error", "")
+
+    with kb.connect() as conn:
+        task_after = kb.get_task(conn, worker_env)
+        run_after = kb.get_run(conn, replacement.current_run_id)
+        assert task_after is not None
+        assert run_after is not None
+        assert task_after.claim_expires == task_before.claim_expires
+        assert run_after.claim_expires == run_before.claim_expires
+        assert task_after.last_heartbeat_at == task_before.last_heartbeat_at
+        assert run_after.last_heartbeat_at == run_before.last_heartbeat_at
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({
@@ -1636,6 +1686,19 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
         kb._set_worker_pid(conn, worker_env, 98765)
         monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(
+            _kb,
+            "_terminate_reclaimed_worker",
+            lambda *args, **kwargs: {
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "root_identity_verified": True,
+                "root_identity_lost": False,
+                "ownership_changed": False,
+                "surviving_pids": [],
+            },
+        )
         assert kb.detect_crashed_workers(conn) == [worker_env]
 
         kb.claim_task(conn, worker_env)

@@ -262,20 +262,36 @@ def heartbeat_current_worker_from_env() -> bool:
         kb, conn = _connect()
         try:
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
             run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
             run_id: Optional[int]
             try:
                 run_id = int(run_id_raw) if run_id_raw else None
             except (TypeError, ValueError):
                 run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+            if claim_lock and run_id is None:
+                claim_ok = False
+            else:
+                try:
+                    claim_ok = kb.heartbeat_claim(
+                        conn,
+                        tid,
+                        claimer=claim_lock,
+                        expected_run_id=run_id,
+                    )
+                except Exception:
+                    claim_ok = False
+                    logger.debug(
+                        "auto-heartbeat: heartbeat_claim failed", exc_info=True,
+                    )
+            if claim_ok:
+                try:
+                    kb.heartbeat_worker(
+                        conn, tid, note=None, expected_run_id=run_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "auto-heartbeat: heartbeat_worker failed", exc_info=True,
+                    )
         finally:
             try:
                 conn.close()
@@ -772,13 +788,27 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            run_id = _worker_run_id(tid)
+            if claim_lock and run_id is None:
+                return tool_error(
+                    f"could not heartbeat {tid} (missing worker run identity)"
+                )
+            claim_ok = kb.heartbeat_claim(
+                conn,
+                tid,
+                claimer=claim_lock,
+                expected_run_id=run_id,
+            )
+            if not claim_ok:
+                return tool_error(
+                    f"could not heartbeat {tid} (claim/run ownership changed)"
+                )
 
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(

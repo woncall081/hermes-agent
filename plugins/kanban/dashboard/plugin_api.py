@@ -858,6 +858,13 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
+                elif current and current.status == "running":
+                    ok = kanban_db.reclaim_task(
+                        conn,
+                        task_id,
+                        reason="dashboard status changed to ready",
+                        expected_run_id=current.current_run_id,
+                    )
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
@@ -997,6 +1004,11 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["status"] == "running" and new_status != "running":
+            # Never clear live ownership from this generic helper.  Callers
+            # that intentionally abort work must use reclaim_task, which
+            # proves exact-run process cleanup before releasing the claim.
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
@@ -1198,6 +1210,13 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
                             ok = kanban_db.unblock_task(conn, tid)
+                        elif cur and cur.status == "running":
+                            ok = kanban_db.reclaim_task(
+                                conn,
+                                tid,
+                                reason="dashboard bulk status changed to ready",
+                                expected_run_id=cur.current_run_id,
+                            )
                         else:
                             ok = _set_status_direct(conn, tid, "ready")
                     elif s == "running":
@@ -1538,7 +1557,12 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn,
+            r.task_id,
+            reason=payload.reason,
+            expected_run_id=run_id,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,
