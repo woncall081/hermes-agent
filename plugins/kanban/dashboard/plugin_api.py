@@ -135,6 +135,40 @@ def _conn(board: Optional[str] = None):
     return kanban_db.connect(board=board)
 
 
+class _DashboardTransitionConflict(RuntimeError):
+    """The observed task could not be made safe for a dashboard mutation."""
+
+
+def _reclaim_running_for_dashboard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+) -> tuple[kanban_db.Task, Optional[int]]:
+    """Re-read and exact-run reclaim a running task before a dashboard write."""
+    observed = kanban_db.get_task(conn, task_id)
+    if observed is None:
+        raise _DashboardTransitionConflict(f"task {task_id} no longer exists")
+    if observed.status != "running":
+        return observed, None
+    observed_run_id = observed.current_run_id
+    if observed_run_id is None:
+        raise _DashboardTransitionConflict(
+            f"task {task_id} is running without a canonical current run"
+        )
+    reclaimed = kanban_db.reclaim_task(
+        conn,
+        task_id,
+        reason=reason,
+        expected_run_id=observed_run_id,
+    )
+    if not reclaimed:
+        raise _DashboardTransitionConflict(
+            f"task {task_id} could not be safely reclaimed; inspect worker cleanup state"
+        )
+    return observed, observed_run_id
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -842,15 +876,33 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
+            reclaimed_run_id = None
+            if s in {"done", "blocked", "archived"}:
+                try:
+                    _, reclaimed_run_id = _reclaim_running_for_dashboard(
+                        conn,
+                        task_id,
+                        reason=f"dashboard status changed to {s}",
+                    )
+                except _DashboardTransitionConflict as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             if s == "done":
                 ok = kanban_db.complete_task(
                     conn, task_id,
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    expected_run_id=reclaimed_run_id,
+                    require_reclaimed=True,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    expected_run_id=reclaimed_run_id,
+                    require_reclaimed=True,
+                )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -869,7 +921,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                ok = kanban_db.archive_task(
+                    conn,
+                    task_id,
+                    require_reclaimed=True,
+                    expected_run_id=reclaimed_run_id,
+                )
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -953,9 +1010,35 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
-        if not ok:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        try:
+            _, reclaimed_run_id = _reclaim_running_for_dashboard(
+                conn,
+                task_id,
+                reason="dashboard task deleted",
+            )
+        except _DashboardTransitionConflict as exc:
+            if kanban_db.get_task(conn, task_id) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"task {task_id} not found",
+                )
+            raise HTTPException(status_code=409, detail=str(exc))
+        ok = kanban_db.delete_task(
+            conn,
+            task_id,
+            require_reclaimed=True,
+            expected_run_id=reclaimed_run_id,
+        )
+        if not ok:
+            if kanban_db.get_task(conn, task_id) is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            raise HTTPException(
+                status_code=409,
+                detail=f"task {task_id} ownership changed before deletion",
+            )
         return {"deleted": True, "task_id": task_id}
     finally:
         conn.close()
@@ -1193,19 +1276,58 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
-                        entry.update(ok=False, error="archive refused")
+                    try:
+                        _, reclaimed_run_id = _reclaim_running_for_dashboard(
+                            conn,
+                            tid,
+                            reason="dashboard bulk task archived",
+                        )
+                    except _DashboardTransitionConflict as exc:
+                        entry.update(ok=False, error=str(exc))
+                        results.append(entry)
+                        continue
+                    if not kanban_db.archive_task(
+                        conn,
+                        tid,
+                        require_reclaimed=True,
+                        expected_run_id=reclaimed_run_id,
+                    ):
+                        entry.update(
+                            ok=False,
+                            error="archive refused because ownership or state changed",
+                        )
+                        results.append(entry)
+                        continue
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    reclaimed_run_id = None
+                    if s in {"done", "blocked"}:
+                        try:
+                            _, reclaimed_run_id = _reclaim_running_for_dashboard(
+                                conn,
+                                tid,
+                                reason=f"dashboard bulk status changed to {s}",
+                            )
+                        except _DashboardTransitionConflict as exc:
+                            entry.update(ok=False, error=str(exc))
+                            results.append(entry)
+                            continue
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            expected_run_id=reclaimed_run_id,
+                            require_reclaimed=True,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task(
+                            conn,
+                            tid,
+                            expected_run_id=reclaimed_run_id,
+                            require_reclaimed=True,
+                        )
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):
@@ -1239,6 +1361,8 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         continue
                     if not ok:
                         entry.update(ok=False, error=f"transition to {s!r} refused")
+                        results.append(entry)
+                        continue
                 if payload.assignee is not None:
                     try:
                         if payload.reclaim_first:

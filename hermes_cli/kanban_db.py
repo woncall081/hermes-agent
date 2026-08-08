@@ -4128,6 +4128,57 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+_RECLAIMED_OWNERSHIP_GUARD_SQL = """
+                   AND status != 'running'
+                   AND claim_lock IS NULL
+                   AND worker_pid IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM task_runs AS open_current_run
+                        WHERE open_current_run.task_id = tasks.id
+                          AND open_current_run.status = 'running'
+                          AND open_current_run.ended_at IS NULL
+                   )
+"""
+
+
+def _terminal_mutation_guard(
+    *,
+    require_reclaimed: bool,
+    expected_run_id: Optional[int] = None,
+) -> tuple[str, tuple[int, ...]]:
+    """Build the opt-in live-ownership and exact-observed-run CAS clauses."""
+    sql = _RECLAIMED_OWNERSHIP_GUARD_SQL if require_reclaimed else ""
+    params: tuple[int, ...] = ()
+    if expected_run_id is not None:
+        observed_run_id = int(expected_run_id)
+        if require_reclaimed:
+            # reclaim_task closes the observed run and clears current_run_id.
+            # Require that exact closed run to still be the newest attempt;
+            # otherwise a replacement claimed the task in the reclaim/mutate gap.
+            sql += """
+                   AND current_run_id IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                         FROM task_runs AS observed_run
+                        WHERE observed_run.id = ?
+                          AND observed_run.task_id = tasks.id
+                          AND observed_run.ended_at IS NOT NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM task_runs AS newer_run
+                        WHERE newer_run.task_id = tasks.id
+                          AND newer_run.id > ?
+                   )
+"""
+            params = (observed_run_id, observed_run_id)
+        else:
+            sql += " AND current_run_id = ?"
+            params = (observed_run_id,)
+    return sql, params
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4137,6 +4188,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    require_reclaimed: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4165,6 +4217,10 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    ``require_reclaimed`` is reserved for dashboard operator actions. When
+    enabled, the completion CAS refuses any live ownership or open run; the
+    default preserves worker and CLI behavior.
     """
     now = int(time.time())
 
@@ -4196,41 +4252,26 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                """,
-                (result, now, task_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
-            )
+        guard_sql, guard_params = _terminal_mutation_guard(
+            require_reclaimed=require_reclaimed,
+            expected_run_id=expected_run_id,
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status       = 'done',
+                   result       = ?,
+                   completed_at = ?,
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL,
+                   block_kind   = NULL,
+                   block_recurrences = 0
+             WHERE id = ?
+               AND status IN ('running', 'ready', 'blocked')
+            """ + guard_sql,
+            (result, now, task_id, *guard_params),
+        )
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
@@ -4698,6 +4739,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    require_reclaimed: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -4725,6 +4767,9 @@ def block_task(
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
+
+    ``require_reclaimed`` applies the same opt-in dashboard ownership guard as
+    :func:`complete_task`; it is disabled by default for existing callers.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -4733,6 +4778,10 @@ def block_task(
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
+        guard_sql, guard_params = _terminal_mutation_guard(
+            require_reclaimed=require_reclaimed,
+            expected_run_id=expected_run_id,
+        )
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -4762,9 +4811,8 @@ def block_task(
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                """ + guard_sql,
+                (kind, task_id, *guard_params),
             )
             if cur.rowcount != 1:
                 return False
@@ -4816,9 +4864,8 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                """ + guard_sql,
+                (kind, recurrences, task_id, *guard_params),
             )
             if cur.rowcount != 1:
                 return False
@@ -4843,37 +4890,20 @@ def block_task(
             )
             routed_to = "triage"
         else:
-            if expected_run_id is None:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
-                )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'blocked',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + guard_sql,
+                (kind, recurrences, task_id, *guard_params),
+            )
             if cur.rowcount != 1:
                 return False
             run_id = _end_run(
@@ -5357,13 +5387,23 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    require_reclaimed: bool = False,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     with write_txn(conn):
+        guard_sql, guard_params = _terminal_mutation_guard(
+            require_reclaimed=require_reclaimed,
+            expected_run_id=expected_run_id,
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived'" + guard_sql,
+            (task_id, *guard_params),
         )
         if cur.rowcount != 1:
             return False
@@ -5409,7 +5449,13 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def delete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    require_reclaimed: bool = False,
+    expected_run_id: Optional[int] = None,
+) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
@@ -5418,9 +5464,19 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
+
+    When ``require_reclaimed`` is true, a live ownership marker or open run
+    also returns ``False`` without deleting any related row.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        guard_sql, guard_params = _terminal_mutation_guard(
+            require_reclaimed=require_reclaimed,
+            expected_run_id=expected_run_id,
+        )
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ?" + guard_sql,
+            (task_id, *guard_params),
+        )
         if cur.rowcount != 1:
             return False
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))

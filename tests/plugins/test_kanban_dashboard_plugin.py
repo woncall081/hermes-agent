@@ -59,6 +59,86 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def _create_running_dashboard_task(client, title="running", *, assignee="worker"):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": title, "assignee": assignee, "priority": 1},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        claimed = kb.claim_task(conn, task["id"], claimer=f"claim-{title}")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        worker_pid = 90000 + int(run_id)
+        assert kb._set_worker_pid(
+            conn,
+            task["id"],
+            worker_pid,
+            expected_claim_lock=claimed.claim_lock,
+            expected_run_id=run_id,
+        )
+        return {
+            "id": task["id"],
+            "claim_lock": claimed.claim_lock,
+            "run_id": run_id,
+            "worker_pid": worker_pid,
+        }
+    finally:
+        conn.close()
+
+
+def _mock_dashboard_worker_cleanup(monkeypatch, outcome=None):
+    calls = []
+    result = outcome or {
+        "host_local": True,
+        "termination_attempted": True,
+        "terminated": True,
+        "root_identity_verified": True,
+        "root_identity_lost": False,
+        "ownership_changed": False,
+        "surviving_pids": [],
+    }
+
+    def terminate(pid, claim_lock, **kwargs):
+        calls.append(
+            {
+                "pid": pid,
+                "claim_lock": claim_lock,
+                "task_id": kwargs.get("task_id"),
+                "run_id": kwargs.get("run_id"),
+            }
+        )
+        return dict(result)
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", terminate)
+    return calls
+
+
+def _dashboard_task_snapshot(conn, task_id):
+    task = conn.execute(
+        "SELECT * FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    return {
+        "task": dict(task) if task is not None else None,
+        "runs": [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ],
+        "events": [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
@@ -317,6 +397,182 @@ def test_patch_status_complete(client):
     assert any(x["id"] == t["id"] for x in done["tasks"])
 
 
+@pytest.mark.parametrize(
+    ("status", "extra_payload", "expected_status"),
+    [
+        (
+            "done",
+            {
+                "result": "shipped",
+                "summary": "released safely",
+                "metadata": {"source": "dashboard"},
+            },
+            "done",
+        ),
+        ("blocked", {"block_reason": "operator hold"}, "blocked"),
+        ("archived", {}, "archived"),
+    ],
+)
+def test_patch_running_terminal_transition_reclaims_exact_worker_first(
+    client, monkeypatch, status, extra_payload, expected_status,
+):
+    running = _create_running_dashboard_task(client, title=f"single-{status}")
+    cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{running['id']}",
+        json={"status": status, **extra_payload},
+    )
+
+    assert response.status_code == 200, response.text
+    assert cleanup_calls == [
+        {
+            "pid": running["worker_pid"],
+            "claim_lock": running["claim_lock"],
+            "task_id": running["id"],
+            "run_id": running["run_id"],
+        }
+    ]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, running["id"])
+        assert task.status == expected_status
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        original_run = kb.get_run(conn, running["run_id"])
+        assert original_run.ended_at is not None
+        assert original_run.outcome == "reclaimed"
+        if status == "done":
+            assert task.result == "shipped"
+            handoff_run = kb.latest_run(conn, running["id"])
+            assert handoff_run.summary == "released safely"
+            assert handoff_run.metadata == {"source": "dashboard"}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("status", ["done", "blocked", "archived"])
+def test_patch_running_transition_refuses_unverified_cleanup(
+    client, monkeypatch, status,
+):
+    running = _create_running_dashboard_task(client, title=f"uncertain-{status}")
+    cleanup_calls = _mock_dashboard_worker_cleanup(
+        monkeypatch,
+        {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "root_identity_verified": False,
+            "root_identity_lost": True,
+            "ownership_changed": False,
+            "surviving_pids": [],
+        },
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{running['id']}",
+        json={
+            "status": status,
+            "block_reason": "requested block",
+            "priority": 8,
+            "title": "must not be applied",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert len(cleanup_calls) == 1
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, running["id"])
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        assert task.priority == 1
+        assert task.title == f"uncertain-{status}"
+        kinds = [event.kind for event in kb.list_events(conn, running["id"])]
+        assert kinds.count("resource_cleanup_unverified") == 1
+        assert "completed" not in kinds
+        assert "archived" not in kinds
+        assert "blocked" not in kinds
+    finally:
+        conn.close()
+
+
+def test_patch_running_transition_refuses_when_worker_survives(client, monkeypatch):
+    running = _create_running_dashboard_task(client, title="worker-survives")
+    _mock_dashboard_worker_cleanup(
+        monkeypatch,
+        {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "root_identity_verified": True,
+            "root_identity_lost": False,
+            "ownership_changed": False,
+            "surviving_pids": [running["worker_pid"]],
+        },
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{running['id']}",
+        json={"status": "done"},
+    )
+
+    assert response.status_code == 409, response.text
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, running["id"])
+        assert task.status == "running"
+        assert task.claim_lock == running["claim_lock"]
+        assert task.worker_pid == running["worker_pid"]
+        assert task.current_run_id == running["run_id"]
+        assert "reclaim_deferred" in {
+            event.kind for event in kb.list_events(conn, running["id"])
+        }
+    finally:
+        conn.close()
+
+
+def test_patch_running_transition_without_canonical_run_fails_closed(
+    client, monkeypatch,
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "missing canonical run", "assignee": "worker"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', claim_lock = ?, "
+                "worker_pid = ? WHERE id = ?",
+                ("orphan-claim", 91234, task["id"]),
+            )
+    finally:
+        conn.close()
+    # The endpoint's idempotent init normally repairs legacy running rows.
+    # Keep this deliberately malformed row intact so the dashboard helper's
+    # own fail-closed behavior is exercised.
+    monkeypatch.setattr(kb, "init_db", lambda *args, **kwargs: None)
+    cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert cleanup_calls == []
+    conn = kb.connect()
+    try:
+        current = kb.get_task(conn, task["id"])
+        assert current.status == "running"
+        assert current.claim_lock == "orphan-claim"
+        assert current.worker_pid == 91234
+        assert current.current_run_id is None
+    finally:
+        conn.close()
+
+
 def test_patch_block_then_unblock(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(
@@ -523,6 +779,270 @@ def test_delete_task_not_found(client):
     r = client.delete("/api/plugins/kanban/tasks/t_nonexistent")
     assert r.status_code == 404
     assert "not found" in r.json()["detail"]
+
+
+def test_delete_returns_not_found_when_task_disappears_before_reclaim_reread(
+    client, monkeypatch,
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "delete disappears before reclaim reread"},
+    ).json()["task"]
+    original_get_task = kb.get_task
+    original_delete_task = kb.delete_task
+    initial_read_seen = False
+
+    def disappear_after_initial_read(conn, task_id):
+        nonlocal initial_read_seen
+        observed = original_get_task(conn, task_id)
+        if task_id == task["id"] and not initial_read_seen:
+            initial_read_seen = True
+            assert observed is not None
+            assert original_delete_task(conn, task_id)
+        return observed
+
+    monkeypatch.setattr(kb, "get_task", disappear_after_initial_read)
+    cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{task['id']}")
+
+    assert response.status_code == 404, response.text
+    assert cleanup_calls == []
+
+
+def test_delete_running_task_reclaims_exact_worker_before_removing_rows(
+    client, monkeypatch,
+):
+    running = _create_running_dashboard_task(client, title="delete-running")
+    cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{running['id']}")
+
+    assert response.status_code == 200, response.text
+    assert cleanup_calls == [
+        {
+            "pid": running["worker_pid"],
+            "claim_lock": running["claim_lock"],
+            "task_id": running["id"],
+            "run_id": running["run_id"],
+        }
+    ]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, running["id"]) is None
+        for table in ("task_runs", "task_events"):
+            count = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?",
+                (running["id"],),
+            ).fetchone()[0]
+            assert count == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("cleanup_mode", ["survives", "unverified"])
+def test_delete_running_task_refuses_failed_cleanup(
+    client, monkeypatch, cleanup_mode,
+):
+    running = _create_running_dashboard_task(client, title=f"delete-{cleanup_mode}")
+    if cleanup_mode == "survives":
+        outcome = {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "root_identity_verified": True,
+            "root_identity_lost": False,
+            "ownership_changed": False,
+            "surviving_pids": [running["worker_pid"]],
+        }
+    else:
+        outcome = {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "root_identity_verified": False,
+            "root_identity_lost": True,
+            "ownership_changed": False,
+            "surviving_pids": [],
+        }
+    _mock_dashboard_worker_cleanup(monkeypatch, outcome)
+
+    response = client.delete(f"/api/plugins/kanban/tasks/{running['id']}")
+
+    assert response.status_code == 409, response.text
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, running["id"])
+        assert task is not None
+        kinds = {event.kind for event in kb.list_events(conn, running["id"])}
+        if cleanup_mode == "survives":
+            assert task.status == "running"
+            assert task.claim_lock == running["claim_lock"]
+            assert task.worker_pid == running["worker_pid"]
+            assert "reclaim_deferred" in kinds
+        else:
+            assert task.status == "blocked"
+            assert task.block_kind == "capability"
+            assert "resource_cleanup_unverified" in kinds
+            assert kb.get_run(conn, running["run_id"]) is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("operation", ["done", "blocked", "archived", "delete"])
+@pytest.mark.parametrize("initially_running", [False, True])
+def test_dashboard_terminal_guard_preserves_replacement_claim(
+    client, monkeypatch, operation, initially_running,
+):
+    if initially_running:
+        original = _create_running_dashboard_task(
+            client, title=f"race-original-{operation}"
+        )
+        task_id = original["id"]
+        cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+    else:
+        task = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": f"race-{operation}-ready", "assignee": "worker"},
+        ).json()["task"]
+        task_id = task["id"]
+        cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+
+    verb_name = {
+        "done": "complete_task",
+        "blocked": "block_task",
+        "archived": "archive_task",
+        "delete": "delete_task",
+    }[operation]
+    original_verb = getattr(kb, verb_name)
+    replacement = {}
+
+    def claim_replacement_then_mutate(conn, target_id, *args, **kwargs):
+        claimed = kb.claim_task(conn, target_id, claimer=f"replacement-{operation}")
+        assert claimed is not None
+        replacement.update(
+            claim_lock=claimed.claim_lock,
+            run_id=claimed.current_run_id,
+            worker_pid=99000 + int(claimed.current_run_id),
+        )
+        assert kb._set_worker_pid(
+            conn,
+            target_id,
+            replacement["worker_pid"],
+            expected_claim_lock=replacement["claim_lock"],
+            expected_run_id=replacement["run_id"],
+        )
+        return original_verb(conn, target_id, *args, **kwargs)
+
+    monkeypatch.setattr(kb, verb_name, claim_replacement_then_mutate)
+    if operation == "delete":
+        response = client.delete(f"/api/plugins/kanban/tasks/{task_id}")
+    else:
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}",
+            json={"status": operation},
+        )
+
+    assert response.status_code == 409, response.text
+    assert len(cleanup_calls) == (1 if initially_running else 0)
+    conn = kb.connect()
+    try:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.claim_lock == replacement["claim_lock"]
+        assert current.current_run_id == replacement["run_id"]
+        assert current.worker_pid == replacement["worker_pid"]
+        run = kb.get_run(conn, replacement["run_id"])
+        assert run.status == "running"
+        assert run.ended_at is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ["patch_archive", "bulk_archive", "delete"],
+)
+def test_dashboard_archive_and_delete_refuse_closed_replacement_after_reclaim(
+    client, monkeypatch, surface,
+):
+    running = _create_running_dashboard_task(
+        client,
+        title=f"closed-replacement-{surface}",
+    )
+    cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+    verb_name = "delete_task" if surface == "delete" else "archive_task"
+    original_terminal_mutation = getattr(kb, verb_name)
+    replacement = {}
+
+    def close_replacement_then_mutate(conn, task_id, *args, **kwargs):
+        claimed = kb.claim_task(
+            conn,
+            task_id,
+            claimer=f"closed-replacement-{surface}",
+        )
+        assert claimed is not None
+        replacement_run_id = claimed.current_run_id
+        assert replacement_run_id is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result=f"replacement result for {surface}",
+            summary=f"replacement summary for {surface}",
+            expected_run_id=replacement_run_id,
+        )
+        replacement["run_id"] = replacement_run_id
+        replacement["snapshot"] = _dashboard_task_snapshot(conn, task_id)
+        return original_terminal_mutation(conn, task_id, *args, **kwargs)
+
+    monkeypatch.setattr(kb, verb_name, close_replacement_then_mutate)
+
+    if surface == "patch_archive":
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{running['id']}",
+            json={"status": "archived"},
+        )
+        assert response.status_code == 409, response.text
+    elif surface == "bulk_archive":
+        response = client.post(
+            "/api/plugins/kanban/tasks/bulk",
+            json={"ids": [running["id"]], "archive": True},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["results"] == [
+            {
+                "id": running["id"],
+                "ok": False,
+                "error": "archive refused because ownership or state changed",
+            }
+        ]
+    else:
+        response = client.delete(
+            f"/api/plugins/kanban/tasks/{running['id']}"
+        )
+        assert response.status_code == 409, response.text
+
+    assert cleanup_calls == [
+        {
+            "pid": running["worker_pid"],
+            "claim_lock": running["claim_lock"],
+            "task_id": running["id"],
+            "run_id": running["run_id"],
+        }
+    ]
+    conn = kb.connect()
+    try:
+        assert _dashboard_task_snapshot(conn, running["id"]) == replacement["snapshot"]
+        current = kb.get_task(conn, running["id"])
+        assert current.status == "done"
+        assert current.result == f"replacement result for {surface}"
+        replacement_run = kb.get_run(conn, replacement["run_id"])
+        assert replacement_run.status == "done"
+        assert replacement_run.outcome == "completed"
+        assert replacement_run.summary == f"replacement summary for {surface}"
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1011,6 +1531,124 @@ def test_bulk_status_done_forwards_completion_summary(client):
         conn.close()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "done", "result": "bulk result", "summary": "bulk summary"},
+        {"status": "blocked"},
+        {"archive": True},
+    ],
+)
+def test_bulk_running_terminal_transition_reclaims_each_exact_worker(
+    client, monkeypatch, payload,
+):
+    running = [
+        _create_running_dashboard_task(client, title=f"bulk-{index}")
+        for index in range(2)
+    ]
+    cleanup_calls = _mock_dashboard_worker_cleanup(monkeypatch)
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task["id"] for task in running], **payload},
+    )
+
+    assert response.status_code == 200, response.text
+    assert all(entry["ok"] for entry in response.json()["results"])
+    assert cleanup_calls == [
+        {
+            "pid": task["worker_pid"],
+            "claim_lock": task["claim_lock"],
+            "task_id": task["id"],
+            "run_id": task["run_id"],
+        }
+        for task in running
+    ]
+    expected_status = (
+        "archived" if payload.get("archive") else payload["status"]
+    )
+    conn = kb.connect()
+    try:
+        for task in running:
+            current = kb.get_task(conn, task["id"])
+            assert current.status == expected_status
+            assert current.claim_lock is None
+            assert current.worker_pid is None
+            original_run = kb.get_run(conn, task["run_id"])
+            assert original_run.outcome == "reclaimed"
+            assert original_run.ended_at is not None
+    finally:
+        conn.close()
+
+
+def test_bulk_cleanup_failure_is_independent_and_short_circuits_entry_mutations(
+    client, monkeypatch,
+):
+    failed = _create_running_dashboard_task(
+        client, title="bulk-failed", assignee="original"
+    )
+    succeeded = _create_running_dashboard_task(
+        client, title="bulk-succeeded", assignee="original"
+    )
+    calls = []
+
+    def terminate(pid, claim_lock, **kwargs):
+        calls.append(kwargs["task_id"])
+        if kwargs["task_id"] == failed["id"]:
+            return {
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": False,
+                "root_identity_verified": False,
+                "root_identity_lost": True,
+                "ownership_changed": False,
+                "surviving_pids": [],
+            }
+        return {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "root_identity_verified": True,
+            "root_identity_lost": False,
+            "ownership_changed": False,
+            "surviving_pids": [],
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", terminate)
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [failed["id"], succeeded["id"]],
+            "status": "done",
+            "assignee": "changed",
+            "priority": 9,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    results = {entry["id"]: entry for entry in response.json()["results"]}
+    assert results[failed["id"]]["ok"] is False
+    assert results[succeeded["id"]]["ok"] is True
+    assert calls == [failed["id"], succeeded["id"]]
+    conn = kb.connect()
+    try:
+        failed_task = kb.get_task(conn, failed["id"])
+        assert failed_task.status == "blocked"
+        assert failed_task.block_kind == "capability"
+        assert failed_task.assignee == "original"
+        assert failed_task.priority == 1
+        failed_kinds = [event.kind for event in kb.list_events(conn, failed["id"])]
+        assert "resource_cleanup_unverified" in failed_kinds
+        assert "completed" not in failed_kinds
+
+        succeeded_task = kb.get_task(conn, succeeded["id"])
+        assert succeeded_task.status == "done"
+        assert succeeded_task.assignee == "changed"
+        assert succeeded_task.priority == 9
+    finally:
+        conn.close()
+
+
 def test_bulk_status_running_rejected(client):
     """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
@@ -1245,7 +1883,7 @@ def test_task_detail_runs_empty_before_claim(client):
     assert d["runs"] == []
 
 
-def test_patch_status_done_with_summary_and_metadata(client):
+def test_patch_status_done_with_summary_and_metadata(client, monkeypatch):
     """PATCH /tasks/:id with status=done + summary + metadata must
     reach complete_task, so the dashboard has CLI parity."""
     # Create + claim.
@@ -1257,6 +1895,7 @@ def test_patch_status_done_with_summary_and_metadata(client):
         kb.claim_task(conn, tid)
     finally:
         conn.close()
+    _mock_dashboard_worker_cleanup(monkeypatch)
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
@@ -1279,7 +1918,7 @@ def test_patch_status_done_with_summary_and_metadata(client):
         conn.close()
 
 
-def test_patch_status_done_without_summary_still_works(client):
+def test_patch_status_done_without_summary_still_works(client, monkeypatch):
     """Back-compat: PATCH without the new fields still completes."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "y", "assignee": "worker"})
     tid = r.json()["task"]["id"]
@@ -1289,6 +1928,7 @@ def test_patch_status_done_without_summary_still_works(client):
         kb.claim_task(conn, tid)
     finally:
         conn.close()
+    _mock_dashboard_worker_cleanup(monkeypatch)
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "done", "result": "legacy shape"},
@@ -1303,7 +1943,7 @@ def test_patch_status_done_without_summary_still_works(client):
         conn.close()
 
 
-def test_patch_status_archive_closes_running_run(client):
+def test_patch_status_archive_closes_running_run(client, monkeypatch):
     """PATCH to archived while running must close the in-flight run."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
     tid = r.json()["task"]["id"]
@@ -1315,6 +1955,7 @@ def test_patch_status_archive_closes_running_run(client):
         assert open_run.ended_at is None
     finally:
         conn.close()
+    _mock_dashboard_worker_cleanup(monkeypatch)
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "archived"},
