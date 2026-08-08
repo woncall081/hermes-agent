@@ -935,6 +935,115 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
 
+
+def test_terminate_reclaimed_worker_owns_descendants_and_tagged_orphans(monkeypatch):
+    """Reclaim owns only the exact run and rescans for late children."""
+    import signal
+    import hermes_cli.kanban_db as _kb
+
+    root_pid = 51001
+    descendant_pid = 51002
+    replacement_pid = 51003
+    orphan_pid = 51004
+    late_child_pid = 51005
+    sanitized_descendant_pid = 51006
+    alive = {
+        root_pid,
+        descendant_pid,
+        replacement_pid,
+        orphan_pid,
+        late_child_pid,
+        sanitized_descendant_pid,
+    }
+    signals = []
+    scans = {"count": 0}
+
+    monkeypatch.setattr(
+        _kb,
+        "_process_tree_pids",
+        lambda pid: [descendant_pid, sanitized_descendant_pid],
+    )
+    monkeypatch.setattr(
+        _kb,
+        "_process_matches_run",
+        lambda pid, task_id, claim_lock, run_id: pid != sanitized_descendant_pid,
+    )
+
+    def _owned(task_id, *, claim_lock=None, run_id=None, exclude=None):
+        assert task_id == "t_owned"
+        assert claim_lock.endswith(":worker")
+        assert run_id == 77
+        scans["count"] += 1
+        return [orphan_pid] if scans["count"] == 1 else [orphan_pid, late_child_pid]
+
+    monkeypatch.setattr(_kb, "_task_owned_pids", _owned)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: pid in alive)
+
+    def _signal(pid, sig):
+        signals.append((pid, sig))
+        if sig == signal.SIGTERM:
+            alive.discard(pid)
+
+    host = _kb._claimer_id().split(":", 1)[0]
+    result = _kb._terminate_reclaimed_worker(
+        root_pid,
+        f"{host}:worker",
+        signal_fn=_signal,
+        task_id="t_owned",
+        run_id=77,
+        grace_polls=2,
+    )
+
+    term_pids = {pid for pid, sig in signals if sig == signal.SIGTERM}
+    assert result["terminated"] is True
+    assert scans["count"] >= 2
+    assert {
+        root_pid,
+        descendant_pid,
+        sanitized_descendant_pid,
+        orphan_pid,
+        late_child_pid,
+    } <= term_pids
+    assert replacement_pid not in term_pids
+    assert replacement_pid in alive
+
+
+def test_terminate_reclaimed_worker_non_linux_root_fallback(monkeypatch):
+    """Platforms without /proc preserve recorded-root containment."""
+    import signal
+    import hermes_cli.kanban_db as _kb
+
+    root_pid = 51101
+    child_pid = 51102
+    alive = {root_pid, child_pid}
+    signals = []
+
+    monkeypatch.setattr(_kb.sys, "platform", "darwin")
+    monkeypatch.setattr(_kb, "_process_env_values", lambda pid: {b"UNRELATED=1"})
+    monkeypatch.setattr(_kb, "_process_matches_run", lambda *args: False)
+    monkeypatch.setattr(_kb, "_process_tree_pids", lambda pid: [child_pid])
+    monkeypatch.setattr(_kb, "_task_owned_pids", lambda *args, **kwargs: [])
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: pid in alive)
+
+    def _signal(pid, sig):
+        signals.append((pid, sig))
+        alive.discard(pid)
+
+    host = _kb._claimer_id().split(":", 1)[0]
+    result = _kb._terminate_reclaimed_worker(
+        root_pid,
+        f"{host}:worker",
+        signal_fn=_signal,
+        task_id="t_non_linux",
+        run_id=88,
+        grace_polls=1,
+    )
+
+    term_pids = {pid for pid, sig in signals if sig == signal.SIGTERM}
+    assert result["terminated"] is True
+    assert term_pids == {root_pid, child_pid}
+
+
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""

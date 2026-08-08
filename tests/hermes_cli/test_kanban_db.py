@@ -353,6 +353,54 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_create_initially_blocked_task_is_sticky_across_recompute(kanban_home):
+    """An explicit initial human hold must not be mistaken for a dependency.
+
+    Regression for a board-reconciliation race where archiving unrelated
+    parents called ``recompute_ready`` and promoted a root task created with
+    ``initial_status='blocked'``. That dispatched work before its runtime
+    prerequisite was installed.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="held until runtime prerequisite is live",
+            assignee="a",
+            initial_status="blocked",
+        )
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+        events = kb.list_events(conn, task_id)
+        assert any(event.kind == "blocked" for event in events)
+
+
+def test_legacy_initial_block_is_sticky_from_created_event(kanban_home):
+    """Upgrade safety: pre-fix initial holds remain sticky.
+
+    Older rows have no dedicated blocked event, but their creation event already
+    records status=blocked. That is enough to distinguish them from later
+    circuit-breaker or direct-DB blocks.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy initial hold",
+            assignee="a",
+            initial_status="blocked",
+        )
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (task_id,),
+        )
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
@@ -786,6 +834,44 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             assert task.status == "ready", (
                 f"task {tid} should stay ready (isolated), got {task.status}"
             )
+
+
+def test_detect_crashed_worker_terminates_tagged_orphan(kanban_home, monkeypatch):
+    """A dead worker root must not release its claim beside a tagged child."""
+    import signal
+    import hermes_cli.kanban_db as _kb
+
+    root_pid = 52001
+    orphan_pid = 52002
+    alive = {orphan_pid}
+    signals = []
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(_kb, "_process_tree_pids", lambda pid: [])
+    monkeypatch.setattr(
+        _kb,
+        "_task_owned_pids",
+        lambda task_id, **kwargs: [orphan_pid],
+    )
+
+    def _signal(pid, sig):
+        signals.append((pid, sig))
+        if sig == signal.SIGTERM:
+            alive.discard(pid)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="crashed root", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, task_id, root_pid)
+
+        crashed = kb.detect_crashed_workers(conn, signal_fn=_signal)
+
+        assert crashed == [task_id]
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert (orphan_pid, signal.SIGTERM) in signals
+        assert orphan_pid not in alive
 
 
 def test_detect_crashed_workers_skips_freshly_claimed_tasks(
